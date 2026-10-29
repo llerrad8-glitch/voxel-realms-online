@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voxel Realms Online</title>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+<style>
+:root{--ink:#0f1a24;--panel:rgba(15,26,36,.86);--chalk:#f2ecd6;--moss:#62b042;--stone:#6f7c88;--sun:#ffd45c;--bad:#ff8a6b}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#87ceeb;color:var(--chalk);font:15px/1.4 "Trebuchet MS","Segoe UI",system-ui,sans-serif}
+#c{position:fixed;inset:0;width:100%;height:100%;display:block}
+[hidden]{display:none!important}
+.overlay{position:fixed;inset:0;display:grid;place-items:center;padding:16px;overflow:auto;background:rgba(8,14,20,.35)}
+.panel{width:min(440px,100%);margin:auto;background:var(--panel);padding:22px 24px;border:3px solid var(--ink);box-shadow:inset 0 0 0 2px rgba(255,255,255,.08),0 10px 0 rgba(0,0,0,.25)}
+h1{margin:0 0 2px;font-size:42px;line-height:1.05;font-weight:900;letter-spacing:1px;color:var(--chalk);text-shadow:1px 1px 0 #9bb36a,2px 2px 0 #7fa04e,3px 3px 0 #5d8238,4px 4px 0 #3d5f26,5px 5px 0 #1d3512}
+.sub{margin:0 0 14px;color:#b9c4ce}
+label{display:block;margin:14px 0 4px;font-weight:700}
+input[type=text]{width:100%;padding:9px 10px;font:inherit;color:var(--chalk);background:#0a121a;border:2px solid #2b3b4a;outline:0}
+input[type=text]:focus{border-color:var(--moss)}
+.row{display:flex;gap:8px}.row>input{flex:1;min-width:0}.row>button{flex:0 0 auto}.row>.go{flex:1;width:auto}
+button{font:inherit;font-weight:800;color:#fff;padding:10px 16px;cursor:pointer;background:var(--stone);border:2px solid var(--ink);box-shadow:inset -3px -3px 0 rgba(0,0,0,.3),inset 3px 3px 0 rgba(255,255,255,.22)}
+button:hover{filter:brightness(1.1)}button:active{box-shadow:inset 3px 3px 0 rgba(0,0,0,.3)}
+button.go{background:var(--moss);width:100%;font-size:17px;padding:13px}
+button:disabled{opacity:.45;cursor:default;filter:none}
+button:focus-visible,input:focus-visible{outline:3px solid var(--sun);outline-offset:2px}
+.msg{min-height:20px;margin-top:12px;color:var(--sun)}
+.keys{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:12px 0 0;color:#b9c4ce;font-size:13px}.keys b{color:var(--chalk);font-weight:700}
+#hud{position:fixed;inset:0;pointer-events:none}
+#cross{position:absolute;left:50%;top:50%;width:18px;height:18px;margin:-9px 0 0 -9px}
+#cross:before,#cross:after{content:"";position:absolute;background:#fff;mix-blend-mode:difference}
+#cross:before{left:8px;top:0;width:2px;height:18px}#cross:after{top:8px;left:0;height:2px;width:18px}
+#bar{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);display:flex;gap:4px}
+.slot{position:relative;width:46px;height:46px;background:rgba(15,26,36,.7);border:3px solid #2b3b4a;display:grid;place-items:center}
+.slot.on{border-color:#fff;background:rgba(15,26,36,.92)}
+.slot canvas{width:32px;height:32px;image-rendering:pixelated}
+.slot i{position:absolute;left:3px;top:0;font:700 11px/14px monospace;color:#cbd5de;font-style:normal}
+#info,#plist{position:absolute;top:8px;font-size:13px;text-shadow:1px 1px 0 #000}
+#info{left:10px}#plist{right:10px;text-align:right;white-space:pre}
+#chat{position:absolute;left:10px;bottom:74px;width:min(460px,70vw)}
+#log div{padding:1px 6px;margin-top:1px;background:rgba(0,0,0,.35);text-shadow:1px 1px 0 #000;word-break:break-word}
+#log .sys{color:var(--sun)}
+#chatIn{pointer-events:auto;margin-top:4px}
+.sl{display:grid;grid-template-columns:110px 1fr;align-items:center;gap:8px;margin:8px 0}
+.code{font:800 22px/1 monospace;letter-spacing:3px;color:var(--sun)}
+.bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="menu" class="overlay"><div class="panel">
+  <h1>Voxel Realms</h1>
+  <p class="sub">Build together, online.</p>
+  <label for="name">Your name</label>
+  <input id="name" type="text" maxlength="16" autocomplete="off" placeholder="Builder">
+  <div style="margin-top:16px"><button id="play" class="go" disabled>Play public world</button></div>
+  <label for="code">Join with a world code</label>
+  <div class="row"><input id="code" type="text" maxlength="10" autocomplete="off" placeholder="K7MQ2X"><button id="join" disabled>Join</button></div>
+  <label for="wname">Create a private world</label>
+  <div class="row"><input id="wname" type="text" maxlength="24" autocomplete="off" placeholder="World name"><input id="seed" type="text" maxlength="24" autocomplete="off" placeholder="Seed (optional)"></div>
+  <div style="margin-top:8px"><button id="create" disabled style="width:100%">Create world</button></div>
+  <div id="menumsg" class="msg" role="status"></div>
+  <div class="keys"><b>WASD, Space</b><span>move and jump, Shift to sprint</span><b>Click</b><span>left breaks, right places</span><b>1-9, wheel</b><span>pick a block</span><b>F, R</b><span>fly on or off, respawn</span><b>Enter</b><span>chat</span></div>
+</div></div>
+
+<div id="hud" hidden>
+  <div id="cross"></div>
+  <div id="info"><div id="conn"></div><div id="save"></div><div id="pos"></div><div id="selname"></div></div>
+  <div id="plist"></div>
+  <div id="chat"><div id="log"></div><input id="chatIn" type="text" maxlength="200" hidden autocomplete="off" placeholder="Message, or /help"></div>
+  <div id="bar"></div>
+</div>
+
+<div id="pause" class="overlay" hidden><div class="panel">
+  <h1 id="pTitle" style="font-size:30px">Paused</h1>
+  <p class="sub" id="pSub"></p>
+  <div>World code <span id="pCode" class="code"></span> <button id="copy" style="padding:4px 10px;margin-left:6px">Copy</button></div>
+  <div class="sl"><span>View distance</span><input id="sDist" type="range" min="3" max="10" step="1"></div>
+  <div class="sl"><span>Field of view</span><input id="sFov" type="range" min="60" max="110" step="1"></div>
+  <div class="sl"><span>Mouse speed</span><input id="sSens" type="range" min="0.3" max="2" step="0.1"></div>
+  <div class="row" style="margin-top:14px"><button id="resume" class="go">Play</button><button id="leave">Leave world</button></div>
+</div></div>
+
+<script type="module" src="game.js"></script>
+</body>
+</html>
