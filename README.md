@@ -1,6 +1,6 @@
 # Voxel Realms Online
 
-A multiplayer voxel sandbox for the browser. Everyone in a world sees the same terrain, the same blocks and each other, live.
+A multiplayer survival sandbox for the browser. Everyone in a world sees the same terrain, the same blocks, the same creatures and each other, live.
 
 ## How it fits together
 
@@ -72,26 +72,64 @@ Worlds are saved shortly after every change, on shutdown, and the HUD shows **Wo
 
 Nothing secret goes into the browser or into Netlify: the only value the page learns is the public server address. Copy `.env.example` for a checklist; never commit a real `.env`.
 
+## Real Minecraft textures
+
+The game draws its own blocks and items in code, so it works with no image files. To use the real textures instead, run this once on your own computer (it needs internet access; the game's folder is the working directory):
+
+```bash
+npm run textures
+```
+
+That downloads the latest Minecraft client from Mojang's own servers (about 25 MB, the same download the official launcher makes), pulls out the textures this game uses into `public/textures/`, and throws the rest away. Add a version number (`npm run textures -- 1.21.4`) or a pack you already have (`npm run textures -- my-pack.zip`) to use another source; any resource pack in the standard `assets/minecraft/textures` layout works, 16x16 packs look best. Deploy afterwards as usual. Anything that is missing from the pack keeps the built-in art, and without a `public/textures/block/stone.png` the game does not look for textures at all.
+
+What the real textures cover: all block faces (grass and leaves are tinted green like the plains in the real game), every item and tool icon, the buckets, the animated water, the mining crack frames, and the sun and moon. Chests (the real one is a 3D model, not a flat texture) and the health, hunger and armor icons keep the built-in art.
+
+The textures belong to Mojang or to the pack's author. Check the licence before you publish a site that serves them to other people.
+
 ## Playing
 
 | Key | Action |
 | --- | --- |
 | W A S D, Space | Move, jump (Space also swims up) |
-| Shift | Sprint (descend while flying) |
-| Left / right click | Break / place the selected block |
-| 1-9 or wheel | Pick a block |
-| F | Toggle flying |
-| R | Respawn at the world spawn (also fixes being stuck) |
+| Double-tap W | Sprint: keep W held (needs food above 3 hearts of hunger); letting go of W, sneaking or stopping ends it |
+| Shift (hold) | Sneak: slower, lower view, and you cannot walk off the edge of a block; descend while flying in creative |
+| C (hold) | Crawl: 0.6 blocks tall, fits through a one block gap |
+| Hold left click | Mine the block under the crosshair (cracks appear, chips fly) or hit a creature or player |
+| Right click | Place a block, open a crafting table, furnace or chest, eat (hold), draw a bow (hold, release to shoot), scoop up or pour out water with a bucket |
+| 1-9 or wheel | Pick a hotbar slot |
+| E | Inventory (Esc or E closes it) |
+| Q, Ctrl+Q | Drop one item, drop the whole stack |
+| F | Fly on or off (creative worlds only) |
+| R | Respawn at the world spawn (also fixes being stuck; limited to once every 8 seconds) |
 | Enter | Chat (`/help`, `/who`; owners also get `/kick name` and `/ban name`) |
 
-**Public world** is always available. **Create a private world** makes a six-character code to share; the creator is its owner. Walking the sea floor, swimming, fog and a shared day-night clock are all in.
+**Public world** is always available (survival, PvP on). **Create a private world** makes a six-character code to share; the creator is its owner and chooses survival or creative, PvP on or off, and whether cheats are allowed. With cheats on, the owner can type `/give diamond_pickaxe 1`, `/spawn zombie`, `/heal`.
+
+## Survival
+
+- **Health and hunger** like the real game: 10 hearts, 10 drumsticks, regeneration when well fed, starvation, fall damage, drowning, suffocation, armor that cuts damage and wears out.
+- **Mining** uses real hardness and tool rules. Stone needs a pickaxe to drop anything, iron ore needs a stone pickaxe, gold and diamond need an iron pickaxe, axes are fast on wood, shovels on dirt. Wooden, stone, iron, golden and diamond tools, swords and armor, plus a bow and arrows.
+- **Inventory** with 27 backpack slots, a 9-slot hotbar, 4 armor slots, a 2x2 crafting grid, left click to pick up and drop, right click to split or place one, shift-click to move stacks fast. Crafting table (3x3), furnace (fuel, smelting progress), and chests all work. The server runs every click, so items cannot be duplicated.
+- **Caves** wind through the ground and open onto hillsides and into the grass, with ore veins (coal, iron, gold, diamond) and gravel pockets. Deep faces get darker, so caves feel like caves.
+- **Eleven creatures:** pig, cow, sheep, chicken, rabbit, wolf (fights back if hit), zombie (burns in daylight), skeleton (shoots arrows), spider (leaps), boomer (swells and explodes, breaking blocks), and slime (big ones split). All are original voxel designs. Animals spawn on grass in the day; monsters spawn at night and in the dark underground.
+- **PvP** with knockback, armor, arrows and critical hits when falling. Dying scatters your items; respawn from the death screen.
+- Day and night with a sun, a moon and stars, shared by everyone in the world.
+
+## Water, buckets, swimming and suffocation
+
+- **Water behaves like the real game.** A source block feeds the four blocks around it, each one a little thinner, up to 7 blocks away. Water over air falls as a full-height column, spreads where it lands, and heads for the nearest drop. Two source blocks next to a gap with a solid or water floor make a new source (infinite water). Take the source away and the flow drains block by block. Steps run four times a second on the server, so everyone sees the same flood, and every step has a budget so a big flood never slows the world. Water surfaces slope smoothly between levels and shimmer.
+- **Buckets.** Craft one from three iron ingots in a V (`I I` over ` I `). Right click a water source with an empty bucket to scoop it up (flowing water cannot be picked up, same as the real game); right click a block with a full bucket to pour a new source against it. Creative worlds do not use up or fill buckets.
+- **Sprinting in water switches to crawl-swimming**: your body lies flat (0.6 blocks tall), you swim faster, and you move the way you look. If a one block gap is too low to stand in, you stay crawling for as long as you are inside it, even after you stop sprinting or leave the water.
+- **Suffocation.** Nothing pushes you out of blocks any more. If any part of your body is inside a block (sand landing on you, a block placed on you) you take half a heart every half second, armor does not help, and the screen goes dark while your head is inside one. Mine or walk your way out.
 
 ## What the server checks
 
-Movement speed (a budget that refills at roughly the game's top speed), reach distance, block ids, bedrock and water rules, not placing a block inside a player, message sizes (4 KB), message rates, connections per address, chat length and control characters, world full or banned. Chat is shown as plain text only, never as HTML.
+Everything that matters is decided on the server: mining time (you must dig long enough), reach, what you hold, placing rules, every inventory click, crafting results, damage, hunger, fall and drowning damage, arrows, creature behavior, item pick-up, container contents. It also checks movement speed (a budget that refills at roughly top speed), message sizes (4 KB), message rates, connections per address, and chat length. Chat is shown as plain text only, never as HTML.
 
-Limits worth knowing: players are guests identified by a token kept in the browser, so a ban can be dodged by clearing site data; there are no accounts yet. The server checks movement speed but not collisions. Every player in a world receives every update (fine for 16 players; it is not area-filtered). Run the server behind HTTPS (hosts like Render provide it) so the browser uses `wss://`.
+Limits worth knowing: players are guests identified by a token kept in the browser, so a ban can be dodged by clearing site data; there are no accounts yet. The server checks movement speed but not collisions, so a hacked client could walk through walls or fly in survival. Every player in a world receives every block update (fine for 16 players). Run the server behind HTTPS (hosts like Render provide it) so the browser uses `wss://`.
+
+**Updating an existing world:** terrain is regenerated from the seed, so old worlds gain caves and ores; blocks you built or removed are kept. Worlds saved by the earlier version become survival worlds.
 
 ## Not built yet
 
-This is a working multiplayer core, not the whole sandbox. Missing: survival (health, hunger, inventory, crafting, smelting), mobs and the boss, the Nether and the End and portals, structures and loot, farming, accounts and per-world settings, sound, touch controls, area-based network filtering. The block table, shared terrain module, authoritative server and save format were built so these can be added one system at a time.
+The Nether, the End, portals and the boss; villages and structures; farming; experience and enchanting; sound; torches and real lighting (caves are dim, not dark); touch controls; accounts. The block, item and creature tables (`public/shared/`) and the server modules (`server/`) were built so these can be added one system at a time.
