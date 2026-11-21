@@ -1,0 +1,1374 @@
+import * as THREE from 'three';
+import { CS, CH, B, BLOCKS, isSolid, isWater, isLava, lavaAmount, LAVA_FALL, isTorch, isBed, isDoor, doorUpper, doorOpen, doorDir, DOOR_OPEN_SIDE, DOOR_T, torchFor, DIR4, BED_H, blockHeight, waterAmount, WATER_FALL, flowDir, idx, genChunk, column, normGen, isLayer, layerKind, layerN, layerFull, isPlant, biomeAt, deepLine } from './shared/world.js';
+import { itemInfo, breakTime, attackCooldown, I } from './shared/items.js';
+const LEAF = (v) => v === B.LEAVES || v === B.SPRUCE_LEAVES; // leaves of either tree let light through
+import { MOB_TYPES, mobDims } from './shared/mobs.js';
+import { UV, PACK, atlas, waterStrip, WATER_FRAMES, flowStrip, FLOW_FRAMES, FLOW_DIR, lavaStrip, LAVA_FRAMES } from './icons.js';
+import { atlasTex, makeMob, makePlayer, setEquipment, itemMesh, arrowMesh, HeldView } from './models.js';
+import { Particles, Cracks } from './fx.js';
+import { createUI } from './ui.js';
+import { createAudio } from './audio.js';
+import { Borders } from './borders.js';
+import { Weather } from './weather.js';
+import { createSaves } from './saves.js';
+import { createGameSaves } from './gamesave.js';
+import { createReminder } from './reminder.js';
+import { createAutosave } from './autosave.js';
+import { createTouch } from './touch.js';
+
+const $ = (id) => document.getElementById(id);
+const atkBar = $('atkbar'), atkFill = $('atkfill');
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('vr.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('vr.' + k, JSON.stringify(v)); } catch { /* storage blocked */ } },
+};
+const cfg = { dist: 5, fov: 75, sens: 1, ...store.get('cfg', {}) };
+const MENU_SEED = 7, W = 0.3, H = 1.8, EYE = 1.62;
+const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const keys = new Set(), others = new Map(), mobs = new Map(), drops = new Map(), arrows = new Map(), fallers = new Map(), ghosts = [];
+let state = 'menu', locked = false, chatOpen = false, leaving = false, joined = false, serverReady = false, dead = false, mode = 'survival';
+let mouseL = false, mouseR = false;
+let net = null, ws = null, session = null, roomInfo = null, retry = 0, myId = 0;
+let tOff = 0, epoch = 0, dayMs = 720000;
+let sleeping = null, sleepT = 0, guardSent = false; // in bed (and for how long); whether the server thinks your shield is up
+const WAKE_KEYS = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'ShiftLeft', 'ShiftRight'];
+const P = { x: 0, y: 40, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, pitch: 0, ground: false, fly: false, sprint: false };
+const stats = { hp: 20, food: 20, air: 15, def: 0 };
+
+/* ---------- renderer ---------- */
+const canvas = $('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(cfg.fov, 1, 0.04, 600);
+camera.rotation.order = 'YXZ';
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 30, 90);
+function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize();
+// World materials: vertex colours carry (sky light, torch light); the shader mixes them with the time of day, so nights and caves are properly dark
+// while torches and lava keep glowing.
+const LIGHT_U = { uSkyMul: { value: new THREE.Vector3(1, 1, 1) } };
+function lightMat(m) {
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.uSkyMul = LIGHT_U.uSkyMul;
+    sh.fragmentShader = 'uniform vec3 uSkyMul;\n' + sh.fragmentShader.replace('#include <color_fragment>',
+      `#ifdef USE_COLOR
+        vec3 skyC = vec3(vColor.r) * uSkyMul;
+        vec3 blkC = vec3(vColor.g, vColor.g * 0.8, vColor.g * 0.5);
+        diffuseColor.rgb *= clamp(skyC + blkC - skyC * blkC, 0.0, 1.0);
+      #endif`);
+  };
+  m.customProgramCacheKey = () => 'vr-light';
+  return m;
+}
+const matO = lightMat(new THREE.MeshBasicMaterial({ map: atlasTex, vertexColors: true }));
+const matP = lightMat(new THREE.MeshBasicMaterial({ map: atlasTex, vertexColors: true, alphaTest: 0.5, side: THREE.DoubleSide })); // dead bushes: transparent pixels are cut out
+const matT = lightMat(new THREE.MeshBasicMaterial({ map: atlasTex, vertexColors: true, transparent: true, opacity: 0.78, depthWrite: false }));
+// Water scrolls through a strip of animation frames (the real water texture when a pack is installed).
+const waterTex = new THREE.CanvasTexture(waterStrip);
+waterTex.magFilter = waterTex.minFilter = THREE.NearestFilter; waterTex.generateMipmaps = false; waterTex.colorSpace = THREE.SRGBColorSpace; waterTex.repeat.set(1, 1 / WATER_FRAMES);
+const matW = lightMat(new THREE.MeshBasicMaterial({ map: waterTex, vertexColors: true, transparent: true, opacity: 0.74, depthWrite: false, side: THREE.DoubleSide }));
+// Flowing water (slopes and waterfalls) uses the separate, larger flowing-water animation; still water keeps the calm one.
+const flowTex = new THREE.CanvasTexture(flowStrip);
+flowTex.magFilter = flowTex.minFilter = THREE.NearestFilter; flowTex.generateMipmaps = false; flowTex.colorSpace = THREE.SRGBColorSpace; flowTex.repeat.set(1, 1 / FLOW_FRAMES);
+const matF = lightMat(new THREE.MeshBasicMaterial({ map: flowTex, vertexColors: true, transparent: true, opacity: 0.74, depthWrite: false, side: THREE.DoubleSide }));
+// Lava glows: an opaque animated strip that ignores the time of day (fog still hides it at a distance).
+const lavaTex = new THREE.CanvasTexture(lavaStrip);
+lavaTex.magFilter = lavaTex.minFilter = THREE.NearestFilter; lavaTex.generateMipmaps = false; lavaTex.colorSpace = THREE.SRGBColorSpace; lavaTex.repeat.set(1, 1 / LAVA_FRAMES);
+const matL = new THREE.MeshBasicMaterial({ map: lavaTex, side: THREE.DoubleSide });
+try { // menus get the dirt texture, like the real game
+  const c = document.createElement('canvas'); c.width = c.height = 64; const g = c.getContext('2d'); g.imageSmoothingEnabled = false; g.drawImage(atlas, 32, 0, 16, 16, 0, 0, 64, 64);
+  document.documentElement.style.setProperty('--dirt', `url(${c.toDataURL()})`);
+} catch { /* canvas blocked: plain panels */ }
+const fx = new Particles(scene), cracks = new Cracks(scene), held = new HeldView(camera, scene);
+const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+const ui = createUI({ send });
+const audio = createAudio(); // sunset music + creature sounds (audio.js)
+const borders = new Borders(scene); // outlines of protected chunks
+const weather = new Weather(scene); // rain, snow and sand in the air
+let hintAt = 0, outsideAt = 0, outside = true, underground = false;
+let wxRain = false, wxSand = false, wxK = 0, sandK = 0, wxKind = 1, biomeNow = 0, biomeAt0 = 0; // weather: rain / sandstorm switched on by the server (separate), how strongly rain or snow shows here (wxK, 0 to 1) and which kind (1 rain, 2 snow), how strongly the sandstorm shows (sandK), and the biome under you
+const saves = createSaves({
+  send, store, lock: () => lock(), onClaims: (list) => borders.set(list), join: (room) => start({ room }),
+  say: (m) => addChat({ sys: 1, m }), api: (path) => fetch(net.http + path, { cache: 'no-store' }).then((r) => { if (!r.ok) throw new Error(); return r.json(); }),
+});
+const hint = (m) => { const t = performance.now(); if (t - hintAt > 1500) { hintAt = t; addChat({ sys: 1, m }); } };
+const protectedMsg = (c) => `This chunk is protected by ${c.owner}'s Chunk Saver: you cannot build, break or open things here.`;
+
+/* ---------- world storage + chunk meshing ---------- */
+let worldSeed = MENU_SEED, worldGen = 2, wantKey = '', want = []; // the title screen flies over the new terrain
+const chunks = new Map(), meshes = new Map(), editsByChunk = new Map(), dirty = new Set();
+const ck = (cx, cz) => cx + ',' + cz;
+const TR = BLOCKS.map((b) => !!(b && b.tr));
+// Torch light. Each chunk that has a torch within reach gets a small light map: a flood fill from every torch (14 at the torch, one less per block,
+// stopped by solid blocks), so a torch lights its room and not the room next door. Chunks with no torch nearby skip all of this.
+const torchChunks = new Map(), LW = 44, LM = 14;
+const isLightId = (v) => (v >= 31 && v <= 35) || (v >= 45 && v <= 49); // torches and lava
+const countTorches = (d) => { let n = 0; for (let i = 0; i < d.length; i++) if (isLightId(d[i])) n++; return n; };
+const torchNear = (cx, cz) => { for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) if (torchChunks.get(ck(cx + a, cz + b))) return true; return false; };
+function lightGrid(cx, cz) {
+  if (!torchNear(cx, cz)) return null;
+  const x0 = cx * CS - LM, z0 = cz * CS - LM, LL = LW * LW, ids = new Uint8Array(LL * CH), light = new Uint8Array(LL * CH), q = [], lava = [];
+  for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) {
+    const c = chunks.get(ck(cx + a, cz + b)); if (!c) continue;
+    const bx = (cx + a) * CS - x0, bz = (cz + b) * CS - z0;
+    for (let y = 0; y < CH; y++) for (let z = 0; z < CS; z++) for (let x = 0; x < CS; x++) {
+      const v = c[x + CS * (z + CS * y)]; if (!v) continue;
+      const gx = bx + x, gz = bz + z; if (gx < 0 || gx >= LW || gz < 0 || gz >= LW) continue;
+      const i = gx + LW * (gz + LW * y); ids[i] = v;
+      if (v >= 31 && v <= 35) { light[i] = 14; q.push(i); } else if (v >= 45 && v <= 49) lava.push(i);
+    }
+  }
+  const openId = (v) => !v || (TR[v] && !(v >= 45 && v <= 49));
+  for (const i of lava) { // only lava that touches open space glows
+    const x = i % LW, z = ((i / LW) | 0) % LW, y = (i / LL) | 0;
+    if ((x > 0 && openId(ids[i - 1])) || (x < LW - 1 && openId(ids[i + 1])) || (z > 0 && openId(ids[i - LW])) || (z < LW - 1 && openId(ids[i + LW])) || (y < CH - 1 && openId(ids[i + LL])) || (y > 0 && openId(ids[i - LL]))) { light[i] = 13; q.push(i); }
+  }
+  let l = 0;
+  const spread = (j) => { if (light[j] < l) { const v = ids[j]; if (!v || TR[v]) { light[j] = l; q.push(j); } } };
+  for (let h = 0; h < q.length; h++) {
+    const i = q[h]; l = light[i] - 1; if (l <= 0) continue;
+    const x = i % LW, z = ((i / LW) | 0) % LW, y = (i / LL) | 0;
+    if (x > 0) spread(i - 1); if (x < LW - 1) spread(i + 1); if (z > 0) spread(i - LW); if (z < LW - 1) spread(i + LW); if (y > 0) spread(i - LL); if (y < CH - 1) spread(i + LL);
+  }
+  return { at: (wx, y, wz) => { const gx = wx - x0, gz = wz - z0; return y < 0 || y >= CH || gx < 0 || gx >= LW || gz < 0 || gz >= LW ? 0 : light[gx + LW * (gz + LW * y)]; } };
+}
+
+function getBlock(x, y, z) {
+  if (y < 0) return B.BEDROCK;
+  if (y >= CH) return 0;
+  const cx = Math.floor(x / CS), cz = Math.floor(z / CS), c = chunks.get(ck(cx, cz));
+  return c ? c[idx(x - cx * CS, y, z - cz * CS)] : B.BEDROCK; // unloaded counts as solid, so nobody falls out of the world
+}
+function setBlock(x, y, z, id) {
+  if (y < 0 || y >= CH) return;
+  const cx = Math.floor(x / CS), cz = Math.floor(z / CS), k = ck(cx, cz), lx = x - cx * CS, lz = z - cz * CS, i = idx(lx, y, lz);
+  let e = editsByChunk.get(k); if (!e) editsByChunk.set(k, (e = new Map()));
+  e.set(i, id); // remembered so the edit survives the chunk being unloaded and regenerated
+  const c = chunks.get(k); if (!c) return;
+  const old = c[i]; c[i] = id; dirty.add(k); topCache.delete(c);
+  const t0 = isLightId(old), t1 = isLightId(id);
+  if (t0 || t1) torchChunks.set(k, (torchChunks.get(k) || 0) + (t1 ? 1 : 0) - (t0 ? 1 : 0));
+  if (t0 || t1 || torchNear(cx, cz)) for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) if (chunks.has(ck(cx + a, cz + b))) dirty.add(ck(cx + a, cz + b)); // light reaches 14 blocks
+  if ((old === 0 || TR[old] || LEAF(old)) !== (id === 0 || TR[id] || LEAF(id)) && !(t0 || t1 || torchNear(cx, cz))) { // opacity changed: sky light may spread differently, up to 14 blocks away
+    let ty = CH - 1; for (; ty > y; ty--) { const v = c[idx(lx, ty, lz)]; if (v && !TR[v] && !LEAF(v)) break; }
+    if (ty <= y) for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) if (chunks.has(ck(cx + a, cz + b))) dirty.add(ck(cx + a, cz + b)); // it is (or was) the top of its column
+  }
+  if (lx === 0) dirty.add(ck(cx - 1, cz)); if (lx === CS - 1) dirty.add(ck(cx + 1, cz));
+  if (lz === 0) dirty.add(ck(cx, cz - 1)); if (lz === CS - 1) dirty.add(ck(cx, cz + 1));
+}
+function dropMesh(k) {
+  const m = meshes.get(k); if (!m) return;
+  for (const o of [m.o, m.t, m.w, m.f, m.l, m.p]) if (o) { scene.remove(o); o.geometry.dispose(); }
+  meshes.delete(k);
+}
+function disposeModel(g) {
+  scene.remove(g); g.traverse((n) => { if (n.geometry) n.geometry.dispose(); });
+  if (g.userData.shadow) { scene.remove(g.userData.shadow); g.userData.shadow.material.dispose(); }
+  for (const m of g.userData.litMats || []) m.dispose();
+}
+// Creatures and other players are lit like the world around them: dimmer at night, in the shade of a roof and in caves, and brighter next to a torch or lava.
+// Each model gets its own copies of its materials (the originals are shared), whose colour is scaled by the light at its feet. A soft blob shadow sits on the ground below.
+const shadowTex = (() => { const c = document.createElement('canvas'); c.width = c.height = 64; const g = c.getContext('2d'), gr = g.createRadialGradient(32, 32, 2, 32, 32, 30); gr.addColorStop(0, 'rgba(0,0,0,0.62)'); gr.addColorStop(0.55, 'rgba(0,0,0,0.38)'); gr.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = gr; g.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c); })();
+const shadowGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2), shadowMat0 = new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+const SKY_COLS = [[0, 0], [2, 0], [-2, 0], [0, 2], [0, -2]];
+function lightModel(model, f) {
+  const g = model.g, lit = (g.userData.litMats ||= []);
+  if (!model.lit) {
+    model.lit = true;
+    for (const p of model.parts) {
+      const src = p.userData.mats, arr = Array.isArray(src) ? src : [src], cl = arr.map((m) => { const c = m.clone(); c.userData.base = c.color.clone(); lit.push(c); return c; });
+      p.userData.mats = Array.isArray(src) ? cl : cl[0]; p.material = model.flash && p.userData.red ? p.material : p.userData.mats;
+    }
+  }
+  for (const p of model.parts) {
+    const red = p.userData.red;
+    if (red) for (const m of red) if (!m.userData.base) { m.userData.base = m.color.clone(); lit.push(m); model.lf = -1; }
+  }
+  if (Math.abs((model.lf === undefined ? -1 : model.lf) - f) < 0.012) return;
+  model.lf = f;
+  for (const p of model.parts) for (const m of [].concat(p.userData.mats, p.userData.red || [])) if (m.userData.base) m.color.copy(m.userData.base).multiplyScalar(f);
+}
+function entLit(o, dims, dt) {
+  o.lt = (o.lt || 0) - dt;
+  if (o.lt <= 0) { // look around a few times a second, not every frame
+    o.lt = 0.25 + Math.random() * 0.15;
+    const bx = Math.floor(o.x), by = Math.floor(o.y + 0.9), bz = Math.floor(o.z); let open = 0, bl = 0;
+    for (const [a, b] of SKY_COLS) { let c = 1; for (let yy = by + 1; yy < Math.min(CH, by + 24); yy++) { const id = getBlock(bx + a, yy, bz + b); if (id && !TR[id]) { c = 0; break; } } open += c; }
+    for (let dy = -3; dy <= 3; dy++) for (let dz = -5; dz <= 5; dz++) for (let dx = -5; dx <= 5; dx++) { const id = getBlock(bx + dx, by + dy, bz + dz); if (isLightId(id)) bl = Math.max(bl, 14 - Math.abs(dx) - Math.abs(dy) - Math.abs(dz)); }
+    o.ls = open / 5; o.lb = bl;
+  }
+  const lum = Math.max(skyFactor(o.ls >= 0.99 ? 15 : o.ls > 0.1 ? 8 + o.ls * 6 : 0) * LIGHT_U.uSkyMul.value.x, blockFactor(o.lb || 0)), f = 0.2 + 0.8 * Math.min(1, lum);
+  o.lv = o.lv === undefined ? f : o.lv + (f - o.lv) * Math.min(1, dt * 6);
+  lightModel(o.model, o.lv);
+  // blob shadow on the ground below (fainter the higher the creature is)
+  const g = o.model.g; let sh = g.userData.shadow;
+  if (!sh) { sh = g.userData.shadow = new THREE.Mesh(shadowGeo, shadowMat0.clone()); sh.renderOrder = 2; scene.add(sh); }
+  let gy = null; const cy = Math.floor(o.y + 0.3);
+  for (let yy = cy; yy > cy - 6 && yy >= 0; yy--) { const id = getBlock(Math.floor(o.x), yy, Math.floor(o.z)); if (isWater(id) || isLava(id)) break; if (isSolid(id)) { gy = yy + blockHeight(id); break; } }
+  const hgt = gy === null ? 9 : o.y - gy;
+  if (hgt > 4.5 || hgt < -0.3) sh.visible = false;
+  else { sh.visible = true; sh.position.set(o.x, gy + 0.02, o.z); const sc = (dims.w * 1.5 + 0.35) * (1 - hgt * 0.1); sh.scale.set(sc, 1, sc); sh.material.opacity = (1 - hgt / 4.5) * (0.35 + 0.65 * Math.min(1, lum + 0.1)); }
+}
+function clearEntities() {
+  for (const o of mobs.values()) disposeModel(o.model.g);
+  for (const o of drops.values()) scene.remove(o.mesh);
+  for (const o of arrows.values()) disposeModel(o.mesh);
+  for (const o of fallers.values()) scene.remove(o.mesh);
+  for (const o of ghosts) disposeModel(o.model.g);
+  mobs.clear(); drops.clear(); arrows.clear(); fallers.clear(); ghosts.length = 0;
+}
+function resetWorld(seed, gen = 1) {
+  for (const k of [...meshes.keys()]) dropMesh(k);
+  chunks.clear(); editsByChunk.clear(); dirty.clear(); wantKey = ''; worldSeed = seed; worldGen = gen;
+  for (const id of [...others.keys()]) removeOther(id);
+  clearEntities(); cracks.hide();
+}
+
+// Faces: d = neighbour offset, s = brightness, k = which tile of the block (0 top, 1 bottom, 2 side), v = corners (counter-clockwise from outside)
+const FACES = [
+  { d: [1, 0, 0], s: 0.8, k: 2, v: [[1, 0, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1]] },
+  { d: [-1, 0, 0], s: 0.8, k: 2, v: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]] },
+  { d: [0, 1, 0], s: 1, k: 0, v: [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]] },
+  { d: [0, -1, 0], s: 0.5, k: 1, v: [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]] },
+  { d: [0, 0, 1], s: 0.7, k: 2, v: [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]] },
+  { d: [0, 0, -1], s: 0.7, k: 2, v: [[1, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]] },
+];
+
+// Only exposed faces become geometry: three meshes per chunk (solid blocks, glass, and water). Faces deep under the surface get darker, so caves
+// are properly dim without a lighting engine, and corners next to other blocks get a soft ambient-occlusion shade.
+const EPS = 0.0012, AOF = [0.62, 0.76, 0.88, 1], AOV = [0, 0, 0, 0], OFF = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+// Sky light: a flood fill from the open sky (15 straight down; one less per block sideways), so cave mouths glow and deep caves go properly dark.
+const SKYM = 14, SKW = CS + 2 * SKYM, TRL = TR; // (TR is the see-through table, defined with the materials)
+const skyFactor = (s) => (s >= 15 ? 1 : 0.004 + 0.996 * Math.pow(0.72, 15 - s)); // (colours are mixed in linear light, so these dip fast) // brightness for a sky light level: the dark end is nearly black
+const blockFactor = (l) => (l <= 0 ? 0 : Math.min(1, Math.pow(l / 14, 1.8) * 1.12)); // brightness for a torch/lava light level
+const opaqueId = (v) => v !== 0 && !TRL[v] && !LEAF(v);
+const topCache = new WeakMap(); // chunk data -> the highest light-blocking block of each column (cleared when the chunk is edited)
+function chunkTop(c) {
+  let t = topCache.get(c);
+  if (!t) { t = new Int16Array(CS * CS); for (let z = 0; z < CS; z++) for (let x = 0; x < CS; x++) { let y = CH - 1; for (; y >= 0; y--) if (opaqueId(c[x + CS * (z + CS * y)])) break; t[x + CS * z] = y; } topCache.set(c, t); }
+  return t;
+}
+function skyGrid(cx, cz) {
+  const cs = [];
+  for (let b = -1; b <= 1; b++) for (let a = -1; a <= 1; a++) cs.push(chunks.get(ck(cx + a, cz + b)) || null);
+  const gx0 = cx * CS - SKYM, gz0 = cz * CS - SKYM, LL = SKW * SKW;
+  const idAt = (gx, y, gz) => { // grid coordinates -> block id (a chunk that is not loaded counts as solid rock)
+    const wx = gx0 + gx, wz = gz0 + gz, qa = Math.floor(wx / CS) - cx + 1, qb = Math.floor(wz / CS) - cz + 1, c = cs[qb * 3 + qa];
+    return c ? c[wx - (cx + qa - 1) * CS + CS * (wz - (cz + qb - 1) * CS + CS * y)] : B.BEDROCK;
+  };
+  const ht = new Int16Array(LL);
+  for (let gz = 0; gz < SKW; gz++) for (let gx = 0; gx < SKW; gx++) {
+    const wx = gx0 + gx, wz = gz0 + gz, qa = Math.floor(wx / CS) - cx + 1, qb = Math.floor(wz / CS) - cz + 1, c = cs[qb * 3 + qa];
+    ht[gx + SKW * gz] = c ? chunkTop(c)[wx - (cx + qa - 1) * CS + CS * (wz - (cz + qb - 1) * CS)] : CH - 1;
+  }
+  const light = new Uint8Array(LL * CH), q = [], DX = [1, -1, 0, 0, 0, 0], DZ = [0, 0, 1, -1, 0, 0], DY = [0, 0, 0, 0, 1, -1];
+  for (let gz = 0; gz < SKW; gz++) for (let gx = 0; gx < SKW; gx++) { // seeds: covered air cells that sit beside open sky
+    const h = ht[gx + SKW * gz];
+    for (let d = 0; d < 4; d++) {
+      const nx = gx + DX[d], nz = gz + DZ[d]; if (nx < 0 || nx >= SKW || nz < 0 || nz >= SKW) continue;
+      for (let y = Math.max(0, ht[nx + SKW * nz] + 1); y <= h; y++) { const i = gx + SKW * gz + LL * y; if (light[i] < 14 && !opaqueId(idAt(gx, y, gz))) { light[i] = 14; q.push(i); } }
+    }
+  }
+  for (let h = 0; h < q.length; h++) {
+    const i = q[h], l = light[i] - 1; if (l <= 0) continue;
+    const y = (i / LL) | 0, r = i - y * LL, gz = (r / SKW) | 0, gx = r - gz * SKW;
+    for (let d = 0; d < 6; d++) {
+      const nx = gx + DX[d], ny = y + DY[d], nz = gz + DZ[d];
+      if (nx < 0 || nx >= SKW || nz < 0 || nz >= SKW || ny < 0 || ny >= CH || ny > ht[nx + SKW * nz]) continue; // (above a column's top it is open sky anyway)
+      const j = nx + SKW * nz + LL * ny;
+      if (light[j] >= l || opaqueId(idAt(nx, ny, nz))) continue;
+      light[j] = l; q.push(j);
+    }
+  }
+  return (wx, y, wz) => {
+    if (y >= CH) return 15; if (y < 0) return 0;
+    const gx = wx - gx0, gz = wz - gz0;
+    if (gx < 0 || gx >= SKW || gz < 0 || gz >= SKW) return 15;
+    return y > ht[gx + SKW * gz] ? 15 : light[gx + SKW * gz + LL * y];
+  };
+}
+const waterTop = (id) => (id === WATER_FALL ? 1 : waterAmount(id) / 9); // height of a water block's surface: a source is 8/9, thin flow 1/9
+function buildMesh(cx, cz) {
+  const k = ck(cx, cz), d = chunks.get(k), ox = cx * CS, oz = cz * CS;
+  const nb = [chunks.get(ck(cx + 1, cz)), chunks.get(ck(cx - 1, cz)), chunks.get(ck(cx, cz + 1)), chunks.get(ck(cx, cz - 1))];
+  const top = new Int16Array(CS * CS); // highest block that shades the column (leaves, glass and water let light through)
+  for (let z = 0; z < CS; z++) for (let x = 0; x < CS; x++) {
+    let y = CH - 1;
+    for (; y >= 0; y--) { const id = d[x + CS * (z + CS * y)]; if (id && !LEAF(id) && !TR[id]) break; }
+    top[x + CS * z] = y;
+  }
+  const blk = (x, y, z) => { // block at chunk-local coordinates, reaching into neighbouring chunks (0 where one is not loaded)
+    if (y < 0) return B.BEDROCK;
+    if (y >= CH) return 0;
+    if (x >= 0 && x < CS && z >= 0 && z < CS) return d[x + CS * (z + CS * y)];
+    const gx = ox + x, gz = oz + z, qx = Math.floor(gx / CS), qz = Math.floor(gz / CS), c = chunks.get(ck(qx, qz));
+    return c ? c[gx - qx * CS + CS * (gz - qz * CS + CS * y)] : 0;
+  };
+  const occ = (x, y, z) => { const id = blk(x, y, z); return id && !TR[id] ? 1 : 0; };
+  const lg = lightGrid(cx, cz), sky = skyGrid(cx, cz), blkL = (x, y, z) => (lg ? lg.at(ox + x, y, oz + z) : 0);
+  // Sun shadows: a place that would otherwise be in full sunlight is dimmed when a block (or a tree's leaves) stands between it and the sun, which is taken to be
+  // up and to one side, about ten blocks of reach. The shadows are baked into the chunk's lighting, so they blur softly across the corners of faces.
+  const SUNV = [0.6, 0.78, 0.46], shM = new Map();
+  const inShade = (x, y, z) => {
+    const key = (y * 64 + z + 20) * 64 + x + 20; let v = shM.get(key);
+    if (v === undefined) {
+      v = 0;
+      for (let i = 1; i <= 10 && !v; i++) { const sy = Math.floor(y + 0.5 + SUNV[1] * i); if (sy >= CH) break; const id = blk(Math.floor(x + 0.5 + SUNV[0] * i), sy, Math.floor(z + 0.5 + SUNV[2] * i)); if (id && !TR[id]) v = 1; }
+      shM.set(key, v);
+    }
+    return v;
+  };
+  const skyL = (x, y, z) => { const s = sky(ox + x, y, oz + z); return s === 15 && inShade(x, y, z) ? 13 : s; };
+  // A vertex colour carries two numbers for the shader: red = sky light (scaled by the daylight), green = torch/lava light (a warm glow that does not fade at night).
+  const pushLight = (out, shade, S, L, ao = 1) => out.c.push(skyFactor(S) * shade * ao, blockFactor(L) * ao * (0.72 + 0.28 * shade), 0);
+  const SM = [0, 0];
+  // Smooth lighting: each corner of a face averages the light of the open cells around it, so light fades across a face instead of in whole-block steps.
+  const smooth = (nx, ny, nz, t1, s1, t2, s2) => {
+    const a = OFF[t1], b = OFF[t2], x1 = nx + a[0] * s1, y1 = ny + a[1] * s1, z1 = nz + a[2] * s1, x2 = nx + b[0] * s2, y2 = ny + b[1] * s2, z2 = nz + b[2] * s2, x3 = x1 + b[0] * s2, y3 = y1 + b[1] * s2, z3 = z1 + b[2] * s2;
+    const o1 = occ(x1, y1, z1), o2 = occ(x2, y2, z2);
+    let sv = skyL(nx, ny, nz), lv = blkL(nx, ny, nz), n = 1;
+    if (!o1) { sv += skyL(x1, y1, z1); lv += blkL(x1, y1, z1); n++; }
+    if (!o2) { sv += skyL(x2, y2, z2); lv += blkL(x2, y2, z2); n++; }
+    if (!(o1 && o2) && !occ(x3, y3, z3)) { sv += skyL(x3, y3, z3); lv += blkL(x3, y3, z3); n++; }
+    SM[0] = sv / n; SM[1] = lv / n;
+  };
+  const aoAt = (x, y, z, t1, s1, t2, s2) => {
+    const a = OFF[t1], b = OFF[t2], o1 = occ(x + a[0] * s1, y + a[1] * s1, z + a[2] * s1), o2 = occ(x + b[0] * s2, y + b[1] * s2, z + b[2] * s2);
+    if (o1 && o2) return 0;
+    return 3 - o1 - o2 - occ(x + a[0] * s1 + b[0] * s2, y + a[1] * s1 + b[1] * s2, z + a[2] * s1 + b[2] * s2);
+  };
+  const O = { p: [], u: [], c: [], i: [] }, T = { p: [], u: [], c: [], i: [] }, Wm = { p: [], u: [], c: [], i: [] }, Fm = { p: [], u: [], c: [], i: [] }, La = { p: [], u: [], c: [], i: [] }, Pl = { p: [], u: [], c: [], i: [] };
+  // Corner height of a water surface: blends the four blocks that touch the corner, so flowing water slopes smoothly like the real game.
+  const cornerH = (x, y, z, qx, qz) => {
+    let sum = 0, wt = 0;
+    for (let i = 0; i < 4; i++) {
+      const bx = x + qx - (i & 1), bz = z + qz - (i >> 1);
+      if (isWater(blk(bx, y + 1, bz))) return 1;
+      const b = blk(bx, y, bz);
+      if (isWater(b)) { const h = waterTop(b); if (h >= 0.8) { sum += h * 10; wt += 10; } else { sum += h; wt += 1; } } else if (!isSolid(b)) wt += 1;
+    }
+    return wt ? sum / wt : 0;
+  };
+  // Water that is not moving is drawn with the calm animation, on every face. The flowing animation is only used on water that is actually
+  // slanted (a flowing block whose surface runs downhill) and on waterfalls, and it is turned so the pattern runs the way the water flows.
+  const STILL_UV = [[0.002, 0.002], [0.998, 0.002], [0.998, 0.998], [0.002, 0.998]], clampUV = (v) => Math.min(0.998, Math.max(0.002, v));
+  const waterBlock = (x, y, z, id) => {
+    const tp = top[x + CS * z], full = id === WATER_FALL || isWater(blk(x, y + 1, z));
+    // Slanted = a flowing (not source) block whose four top corners are not level. Source blocks and level pools are always still.
+    let slanted = false;
+    if (id !== B.WATER && !full) {
+      const hs = [cornerH(x, y, z, 0, 0), cornerH(x, y, z, 1, 0), cornerH(x, y, z, 0, 1), cornerH(x, y, z, 1, 1)];
+      slanted = Math.max(...hs) - Math.min(...hs) > 0.02;
+    }
+    const dir = slanted ? flowDir(blk, x, y, z) : [0, 0];
+    const moving = id === WATER_FALL || !!(dir[0] || dir[1]); // slanted AND actually running somewhere; level water is always still
+    const flow = moving ? (id === WATER_FALL ? flowDir(blk, x, y, z) : dir) : [0, 0];
+    for (let f = 0; f < 6; f++) {
+      const F = FACES[f]; if (F.d[1] < 0) continue;
+      const nid = blk(x + F.d[0], y + F.d[1], z + F.d[2]);
+      if (isWater(nid) || (nid && !TR[nid])) continue; // water against water or a solid block: nothing to see
+      const isTop = F.d[1] > 0, out = (isTop ? (id !== WATER_FALL && (flow[0] || flow[1])) : id === WATER_FALL) ? Fm : Wm; // only waterfalls (sides) and slanted tops run; everything else is calm
+      const base = out.p.length / 3, S = skyL(x, y, z), L = blkL(x, y, z);
+      let vi = 0;
+      for (const q of F.v) {
+        const h = q[1] ? (full ? 1 : cornerH(x, y, z, q[0], q[2])) : 0;
+        out.p.push(ox + x + q[0], y + h, oz + z + q[2]); pushLight(out, F.s, S, L);
+        if (out === Wm) { // calm picture: the top fills the face, the sides are cut off at the water's height so it is never stretched
+          if (isTop) out.u.push(STILL_UV[vi][0], STILL_UV[vi][1]);
+          else out.u.push(clampUV((F.d[0] ? q[2] : q[0]) * 1), clampUV(q[1] ? h : 0));
+        } else if (isTop) { // slanted surface: the pattern's "up" points against the flow so it appears to run along it
+          const bx = -FLOW_DIR * flow[0], bz = -FLOW_DIR * flow[1], rx = q[0] - 0.5, rz = q[2] - 0.5;
+          out.u.push(clampUV(0.5 + 0.5 * (bz * rx - bx * rz)), clampUV(0.5 + 0.5 * (bx * rx + bz * rz)));
+        } else { // sides of moving water: the pattern runs downward, like a waterfall
+          const yi = q[1] ? (1 - h) * 0.5 : 0.5;
+          out.u.push(clampUV(0.02 + (F.d[0] ? q[2] : q[0]) * 0.46), clampUV(FLOW_DIR > 0 ? 1 - yi : yi));
+        }
+        vi++;
+      }
+      out.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  };
+  // Lava: opaque, glowing (no day/night shading), always the same animation. A source is 8/9 tall, flowing lava 2/9 per level.
+  const lavaH = (id) => (id === LAVA_FALL ? 1 : lavaAmount(id) >= 4 ? 8 / 9 : lavaAmount(id) * 2 / 9);
+  // Corner height of a lava surface: like water, it blends the blocks that touch the corner, so flowing lava slopes smoothly instead of stepping.
+  const lavaCorner = (x, y, z, qx, qz) => {
+    let sum = 0, wt = 0;
+    for (let i = 0; i < 4; i++) {
+      const bx = x + qx - (i & 1), bz = z + qz - (i >> 1);
+      if (isLava(blk(bx, y + 1, bz))) return 1;
+      const b = blk(bx, y, bz);
+      if (isLava(b)) { const h = lavaH(b); if (h >= 0.8) { sum += h * 10; wt += 10; } else { sum += h; wt += 1; } } else if (!isSolid(b)) wt += 1;
+    }
+    return wt ? sum / wt : 0;
+  };
+  const lavaBlock = (x, y, z, id) => {
+    const full = id === LAVA_FALL || isLava(blk(x, y + 1, z)), h = full ? 1 : lavaH(id);
+    for (let f = 0; f < 6; f++) {
+      const F = FACES[f], nid = blk(x + F.d[0], y + F.d[1], z + F.d[2]);
+      if (nid && !TR[nid]) continue;
+      if (isLava(nid) && (F.d[1] !== 0 || isLava(blk(x + F.d[0], y + 1, z + F.d[2])) || lavaH(nid) >= h - 0.001)) continue;
+      const isTop = F.d[1] > 0, base = La.p.length / 3; let vi = 0;
+      for (const q of F.v) {
+        const hh = q[1] ? (full ? 1 : lavaCorner(x, y, z, q[0], q[2])) : 0;
+        La.p.push(ox + x + q[0], y + hh, oz + z + q[2]); La.c.push(1, 1, 1);
+        if (isTop || F.d[1] < 0) La.u.push(STILL_UV[vi][0], STILL_UV[vi][1]); else La.u.push(clampUV(F.d[0] ? q[2] : q[0]), clampUV(hh));
+        vi++;
+      }
+      La.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  };
+  // A torch is a 2 x 10 x 2 pixel stick (tilted away from the wall when it hangs on one); the flame end glows on its own.
+  const TH = 0.625, HW = 0.0625, CT = Math.cos(0.3927), ST = Math.sin(0.3927);
+  const torchBlock = (x, y, z, id) => {
+    const ts = skyFactor(skyL(x, y, z)), uv = UV[27], uu = (f) => uv[0] + (uv[2] - uv[0]) * f, vv = (f) => uv[1] + (uv[3] - uv[1]) * f, wall = id > 31, n = wall ? DIR4[id - 32] : [0, 0];
+    const at = (px, py, pz) => {
+      if (!wall) return [ox + x + 0.5 + px, y + py, oz + z + 0.5 + pz];
+      const s = px * n[0] + pz * n[1], t = -px * n[1] + pz * n[0], s2 = s * CT + py * ST, y2 = -s * ST + py * CT;
+      return [ox + x + 0.5 - n[0] * 0.34 + s2 * n[0] - t * n[1], y + 0.2 + y2, oz + z + 0.5 - n[1] * 0.34 + s2 * n[1] + t * n[0]];
+    };
+    const quad = (F, y0, y1, v0, v1, col) => {
+      const base = O.p.length / 3; let i = 0;
+      for (const q of F.v) { O.p.push(...at((q[0] ? 1 : -1) * HW, q[1] ? y1 : y0, (q[2] ? 1 : -1) * HW)); O.c.push(ts, col > 2 ? 1 : 0.5, 0); O.u.push(i === 0 || i === 3 ? uu(7 / 16) : uu(9 / 16), i < 2 ? vv(v0) : vv(v1)); i++; }
+      O.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    };
+    for (const f of [0, 1, 4, 5]) { quad(FACES[f], 0, 0.5, 0, 0.5, 1.25); quad(FACES[f], 0.5, TH, 0.5, 0.625, 3); }
+    quad(FACES[2], TH, TH, 0.5, 0.625, 3);
+  };
+  // A bed is 9/16 of a block tall. The blanket picture on top runs along the bed (pillow at the head end); the two halves join up without a seam.
+  const bedBlock = (x, y, z, id) => {
+    const head = id >= 40, dir = (id - 36) & 3, [dx, dz] = DIR4[dir], tp = top[x + CS * z], uvT = UV[head ? 29 : 28], uvS = UV[30];
+    for (let f = 0; f < 6; f++) {
+      const F = FACES[f]; if (F.d[1] < 0) continue;
+      if (F.d[1] === 0 && ((!head && F.d[0] === dx && F.d[2] === dz) || (head && F.d[0] === -dx && F.d[2] === -dz))) continue; // between the two halves
+      const nid = blk(x + F.d[0], y + F.d[1], z + F.d[2]);
+      if (nid && !TR[nid]) continue;
+      const S = skyL(x + F.d[0], y + F.d[1], z + F.d[2]), L = blkL(x + F.d[0], y + F.d[1], z + F.d[2]), base = O.p.length / 3;
+      let i = 0;
+      for (const q of F.v) {
+        O.p.push(ox + x + q[0], y + q[1] * BED_H, oz + z + q[2]); pushLight(O, F.s, S, L);
+        if (F.d[1] > 0) { const a = dir === 0 ? q[0] : dir === 1 ? 1 - q[0] : dir === 2 ? q[2] : 1 - q[2], c = dir < 2 ? q[2] : q[0]; O.u.push(uvT[0] + (uvT[2] - uvT[0]) * c, uvT[1] + (uvT[3] - uvT[1]) * a); }
+        else O.u.push(i === 0 || i === 3 ? uvS[0] : uvS[2], uvS[1] + (uvS[3] - uvS[1]) * (q[1] ? 1 : 7 / 16));
+        i++;
+      }
+      O.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  };
+  // A door is a thin upright panel (3/16 of a block thick) on one side of its cell, turned to the next side when open. Faces on the cell's edge hide behind opaque blocks.
+  const doorBlock = (x, y, z, id) => {
+    const side = doorOpen(id) ? DOOR_OPEN_SIDE[doorDir(id)] : doorDir(id), uv = UV[BLOCKS[id].t[2]], T = DOOR_T;
+    const bx = side === 0 ? [1 - T, 1] : side === 1 ? [0, T] : [0, 1], bz = side === 2 ? [1 - T, 1] : side === 3 ? [0, T] : [0, 1];
+    for (let f = 0; f < 6; f++) {
+      const F = FACES[f], edge = F.d[0] > 0 ? bx[1] === 1 : F.d[0] < 0 ? bx[0] === 0 : F.d[2] > 0 ? bz[1] === 1 : F.d[2] < 0 ? bz[0] === 0 : true;
+      const nx = x + F.d[0], ny = y + F.d[1], nz = z + F.d[2], nid = blk(nx, ny, nz);
+      if (F.d[1] !== 0) { if (isDoor(nid)) continue; if (nid && !TR[nid]) continue; }
+      else if (edge && nid && !TR[nid]) continue;
+      const lx = edge || F.d[1] !== 0 ? nx : x, ly = edge || F.d[1] !== 0 ? ny : y, lz = edge || F.d[1] !== 0 ? nz : z;
+      const S = skyL(lx, ly, lz), L = blkL(lx, ly, lz), base = O.p.length / 3; let i = 0;
+      for (const q of F.v) {
+        O.p.push(ox + x + bx[0] + q[0] * (bx[1] - bx[0]), y + q[1], oz + z + bz[0] + q[2] * (bz[1] - bz[0])); pushLight(O, F.s, S, L);
+        if (F.d[1] !== 0) O.u.push(i === 0 || i === 3 ? uv[0] : uv[2], i < 2 ? uv[1] : uv[3]);
+        else O.u.push(i === 0 || i === 3 ? uv[0] : uv[2], q[1] ? uv[3] : uv[1]);
+        i++;
+      }
+      O.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  };
+  // A sand or snow layer is a slab 1 to 7 eighths tall. Its sides show the top of the picture, and a side is hidden by a full block or an equal or taller layer next to it.
+  const layerBlock = (x, y, z, id) => {
+    const hg = layerN(id) / 8, uv = UV[BLOCKS[id].t[0]];
+    for (let f = 0; f < 6; f++) {
+      const F = FACES[f], nx = x + F.d[0], ny = y + F.d[1], nz = z + F.d[2], nid = blk(nx, ny, nz);
+      if (nid && !TR[nid]) continue;
+      if (F.d[1] === 0 && isLayer(nid) && layerN(nid) >= layerN(id)) continue;
+      const S = skyL(nx, ny, nz), L = blkL(nx, ny, nz), base = O.p.length / 3; let i = 0;
+      for (const q of F.v) {
+        O.p.push(ox + x + q[0], y + q[1] * hg, oz + z + q[2]); pushLight(O, F.s, S, L);
+        if (F.d[1] !== 0) O.u.push(i === 0 || i === 3 ? uv[0] : uv[2], i < 2 ? uv[1] : uv[3]);
+        else O.u.push(i === 0 || i === 3 ? uv[0] : uv[2], uv[1] + (uv[3] - uv[1]) * (q[1] ? 1 : 1 - hg));
+        i++;
+      }
+      O.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  };
+  // A dead bush is two crossed upright pictures; the see-through pixels are cut out.
+  const plantBlock = (x, y, z, id) => {
+    const uv = UV[BLOCKS[id].t[0]], S = skyL(x, y, z), L = blkL(x, y, z);
+    for (const [ax, az, bx, bz] of [[0.06, 0.06, 0.94, 0.94], [0.94, 0.06, 0.06, 0.94]]) {
+      const base = Pl.p.length / 3;
+      Pl.p.push(ox + x + ax, y, oz + z + az, ox + x + bx, y, oz + z + bz, ox + x + bx, y + 1, oz + z + bz, ox + x + ax, y + 1, oz + z + az);
+      for (let k = 0; k < 4; k++) pushLight(Pl, 0.92, S, L);
+      Pl.u.push(uv[0], uv[1], uv[2], uv[1], uv[2], uv[3], uv[0], uv[3]);
+      Pl.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  };
+  let hi = d.length - 1; while (hi >= 0 && !d[hi]) hi--; // (nothing above the highest block needs a look)
+  const ymax = hi < 0 ? -1 : Math.floor(hi / (CS * CS));
+  for (let y = 0; y <= ymax; y++) for (let z = 0; z < CS; z++) for (let x = 0; x < CS; x++) {
+    const id = d[x + CS * (z + CS * y)];
+    if (!id) continue;
+    if (isWater(id)) { if (id === B.SEAWEED) plantBlock(x, y, z, id); waterBlock(x, y, z, id); continue; } // (seaweed is a plant standing in a block of still water)
+    if (id >= 55 && id <= 75) { layerBlock(x, y, z, id); continue; }
+    if (id === 54) { plantBlock(x, y, z, id); continue; }
+    if (isLava(id)) { lavaBlock(x, y, z, id); continue; }
+    if (id >= 31 && id <= 35) { torchBlock(x, y, z, id); continue; }
+    if (id >= 36 && id <= 43) { bedBlock(x, y, z, id); continue; }
+    if (id >= 77 && id <= 92) { doorBlock(x, y, z, id); continue; }
+    const def = BLOCKS[id], out = def.tr ? T : O, tp = top[x + CS * z];
+    for (let f = 0; f < 6; f++) {
+      const F = FACES[f], nx = x + F.d[0], ny = y + F.d[1], nz = z + F.d[2];
+      if (ny < 0) continue;
+      let nid = 0;
+      if (ny < CH) {
+        if (nx < 0) nid = nb[1][CS - 1 + CS * (nz + CS * ny)];
+        else if (nx >= CS) nid = nb[0][CS * (nz + CS * ny)];
+        else if (nz < 0) nid = nb[3][nx + CS * (CS - 1 + CS * ny)];
+        else if (nz >= CS) nid = nb[2][nx + CS * CS * ny];
+        else nid = d[nx + CS * (nz + CS * ny)];
+      }
+      if (nid && !(TR[nid] && nid !== id)) continue;
+      const uv = UV[def.t[F.k]], base = out.p.length / 3, ax = F.d[0] ? 0 : F.d[1] ? 1 : 2, t1 = (ax + 1) % 3, t2 = (ax + 2) % 3;
+      let n = 0;
+      for (const q of F.v) {
+        // each face is grown by a hair along its own plane so neighbouring faces overlap slightly: no hairline gaps to see through at shallow angles
+        out.p.push(ox + x + q[0] + (F.d[0] ? 0 : q[0] ? EPS : -EPS), y + q[1] + (F.d[1] ? 0 : q[1] ? EPS : -EPS), oz + z + q[2] + (F.d[2] ? 0 : q[2] ? EPS : -EPS));
+        let a = 3;
+        if (def.tr) { pushLight(out, F.s, skyL(nx, ny, nz), blkL(nx, ny, nz)); }
+        else { a = aoAt(nx, ny, nz, t1, q[t1] ? 1 : -1, t2, q[t2] ? 1 : -1); smooth(nx, ny, nz, t1, q[t1] ? 1 : -1, t2, q[t2] ? 1 : -1); pushLight(out, F.s, SM[0], SM[1], AOF[a]); }
+        AOV[n++] = a;
+      }
+      out.u.push(uv[0], uv[1], uv[2], uv[1], uv[2], uv[3], uv[0], uv[3]);
+      if (AOV[0] + AOV[2] < AOV[1] + AOV[3]) out.i.push(base + 1, base + 2, base + 3, base + 1, base + 3, base); // split along the diagonal that avoids the darkest corner
+      else out.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  }
+  dropMesh(k);
+  const mk = (b, mat, order) => {
+    if (!b.i.length) return null;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(b.p, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(b.u, 2));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(b.c, 3));
+    g.setIndex(b.i); g.computeBoundingSphere();
+    const m = new THREE.Mesh(g, mat); m.renderOrder = order; scene.add(m); return m;
+  };
+  meshes.set(k, { o: mk(O, matO, 0), t: mk(T, matT, 1), w: mk(Wm, matW, 2), f: mk(Fm, matF, 2), l: mk(La, matL, 0), p: mk(Pl, matP, 0) });
+}
+
+// Generate nearest chunks first, mesh only once all four neighbours exist, and stay inside a per-frame time budget.
+function streamChunks(px, pz, budget) {
+  const pcx = Math.floor(px / CS), pcz = Math.floor(pz / CS), R = cfg.dist, key = pcx + ',' + pcz + ',' + R;
+  if (key !== wantKey) {
+    wantKey = key; want = [];
+    for (let dz = -R - 1; dz <= R + 1; dz++) for (let dx = -R - 1; dx <= R + 1; dx++) {
+      const d2 = dx * dx + dz * dz;
+      if (d2 <= (R + 1) * (R + 1)) want.push([pcx + dx, pcz + dz, d2]);
+    }
+    want.sort((a, b) => a[2] - b[2]);
+    for (const k of [...chunks.keys()]) {
+      const [x, z] = k.split(',').map(Number);
+      if ((x - pcx) ** 2 + (z - pcz) ** 2 > (R + 3) ** 2) { chunks.delete(k); torchChunks.delete(k); dropMesh(k); dirty.delete(k); }
+    }
+  }
+  const t0 = performance.now();
+  for (const [cx, cz] of want) {
+    if (performance.now() - t0 > budget) return;
+    const k = ck(cx, cz);
+    if (chunks.has(k)) continue;
+    const d = genChunk(cx, cz, worldSeed, worldGen), e = editsByChunk.get(k);
+    if (e) for (const [i, id] of e) d[i] = id;
+    chunks.set(k, d);
+    const nt = countTorches(d);
+    if (nt) { torchChunks.set(k, nt); for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) if ((a || b) && chunks.has(ck(cx + a, cz + b))) dirty.add(ck(cx + a, cz + b)); }
+  }
+  for (const [cx, cz, d2] of want) {
+    if (d2 > R * R) break;
+    if (performance.now() - t0 > budget) return;
+    const k = ck(cx, cz);
+    if (meshes.has(k) && !dirty.has(k)) continue;
+    if (!chunks.has(k) || !chunks.has(ck(cx + 1, cz)) || !chunks.has(ck(cx - 1, cz)) || !chunks.has(ck(cx, cz + 1)) || !chunks.has(ck(cx, cz - 1))) continue;
+    dirty.delete(k); buildMesh(cx, cz);
+  }
+}
+function chunksReady() {
+  const pcx = Math.floor(P.x / CS), pcz = Math.floor(P.z / CS);
+  for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) if (!chunks.has(ck(pcx + dx, pcz + dz))) return false;
+  return true;
+}
+
+/* ---------- player physics, picking ---------- */
+// Poses: 0 standing, 1 sneaking (slow, never walks off an edge), 2 crawling (0.6 high: fits a one block gap).
+const POSE_H = [1.8, 1.5, 0.6], POSE_EYE = [1.62, 1.27, 0.4];
+let pose = 0, eyeY = EYE, sprintOn = false, lastTapW = 0;
+function collides(x, y, z, h = POSE_H[pose], ign) { // ign: blocks the player is already buried in, which do not push back
+  const x0 = Math.floor(x - W + 1e-4), x1 = Math.floor(x + W - 1e-4), y0 = Math.floor(y + 1e-4), y1 = Math.floor(y + h - 1e-4), z0 = Math.floor(z - W + 1e-4), z1 = Math.floor(z + W - 1e-4);
+  for (let by = y0; by <= y1; by++) for (let bz = z0; bz <= z1; bz++) for (let bx = x0; bx <= x1; bx++) { const id = getBlock(bx, by, bz); if (isSolid(id) && (blockHeight(id) >= 1 || y < by + blockHeight(id) - 1e-4) && !(ign && ign.has(bx + ',' + by + ',' + bz))) return true; }
+  return false;
+}
+function landY(x, y, z) { // where you come to rest: on top of the block, or 9/16 up for a bed
+  const by = Math.floor(y + 1e-4); let top = by;
+  for (let bz = Math.floor(z - W + 1e-4); bz <= Math.floor(z + W - 1e-4); bz++) for (let bx = Math.floor(x - W + 1e-4); bx <= Math.floor(x + W - 1e-4); bx++) { const id = getBlock(bx, by, bz); if (isSolid(id)) top = Math.max(top, by + blockHeight(id)); }
+  return top === by ? by + 1 : top;
+}
+function buriedIn(x, y, z, h) {
+  const s = new Set();
+  for (let by = Math.floor(y + 1e-4); by <= Math.floor(y + h - 1e-4); by++) for (let bz = Math.floor(z - W + 1e-4); bz <= Math.floor(z + W - 1e-4); bz++) for (let bx = Math.floor(x - W + 1e-4); bx <= Math.floor(x + W - 1e-4); bx++) { const id = getBlock(bx, by, bz); if (isSolid(id) && (blockHeight(id) >= 1 || y < by + blockHeight(id) - 1e-4)) s.add(bx + ',' + by + ',' + bz); }
+  return s;
+}
+function eyeInWater() { // the eye is under the actual water surface, which is lower than the top of the block for sources and flows
+  const ex = Math.floor(P.x), ey = Math.floor(P.y + eyeY), ez = Math.floor(P.z), id = getBlock(ex, ey, ez);
+  if (!isWater(id)) return false;
+  return isWater(getBlock(ex, ey + 1, ez)) || P.y + eyeY - ey < waterTop(id);
+}
+// Low things (a bed, a snow or sand layer: up to 0.6 of a block) are walked up without jumping; anything taller needs a jump.
+function stepUp(nx, nz, h0, ign, swim) {
+  if (!P.ground || P.fly || swim) return false;
+  for (let dy = 0.125; dy <= 0.6; dy += 0.125) if (!collides(nx, P.y + dy, nz, h0, ign)) { P.y += dy; return true; }
+  return false;
+}
+// If a layer has formed around your feet, you are lifted onto it instead of being stuck in it.
+function layerLift(h0) {
+  if (P.fly || !collides(P.x, P.y, P.z, h0)) return;
+  for (const k of buriedIn(P.x, P.y, P.z, h0)) { const [a, b, c] = k.split(',').map(Number); if (!isLayer(getBlock(a, b, c))) return; }
+  for (let dy = 0.125; dy <= 0.8; dy += 0.125) if (!collides(P.x, P.y + dy, P.z, h0)) { P.y += dy; P.vy = Math.max(P.vy, 0); P.ground = true; return; }
+}
+function physics(dt) {
+  const fwd = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0), side = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+  const shift = keys.has('ShiftLeft') || keys.has('ShiftRight'), jump = keys.has('Space');
+  if (mode !== 'creative') P.fly = false;
+  const bx = Math.floor(P.x), bz = Math.floor(P.z);
+  const inLavaF = isLava(getBlock(bx, Math.floor(P.y + 0.2), bz)), inLavaW = isLava(getBlock(bx, Math.floor(P.y + 0.9), bz)); // lava can be swum in, like water but slower (it still burns)
+  const swim = isWater(getBlock(bx, Math.floor(P.y + 0.2), bz)) || inLavaF, waist = isWater(getBlock(bx, Math.floor(P.y + 0.9), bz)) || inLavaW;
+  // Sprinting: double-tap W, keep W held. It ends when W is released, when you stop, sneak, or run low on food.
+  const sneakKey = shift && !P.fly;
+  if (!keys.has('KeyW') || fwd <= 0 || sneakKey || P.fly || (mode !== 'creative' && stats.food <= 6)) sprintOn = false;
+  P.sprint = sprintOn;
+  // Sprinting in water switches to crawl-swimming. Whenever the standing body would not fit (a one block gap), you stay crawling.
+  const swimCrawl = P.sprint && (pose === 2 ? swim : waist);
+  let np = P.fly ? 0 : swimCrawl || keys.has('KeyC') ? 2 : sneakKey ? 1 : 0;
+  while (np < 2 && collides(P.x, P.y, P.z, POSE_H[np])) np++;
+  if (np === 2 && collides(P.x, P.y, P.z, POSE_H[2])) np = pose; // buried in blocks: keep the pose, suffocation does the rest
+  pose = np;
+  layerLift(POSE_H[pose]);
+  const h0 = POSE_H[pose], ign = collides(P.x, P.y, P.z, h0) ? buriedIn(P.x, P.y, P.z, h0) : null; // inside blocks: no pushing out, just move on
+  const sy = Math.sin(P.yaw), cy = Math.cos(P.yaw), [cfx, cfz] = swim && !inLavaF ? flowDir(getBlock, bx, Math.floor(P.y + 0.2), bz) : [0, 0]; // flowing water carries you along
+  let wx = -sy * fwd + cy * side, wz = -cy * fwd - sy * side;
+  const len = Math.hypot(wx, wz); if (len > 1) { wx /= len; wz /= len; }
+  const speed = P.fly ? 11 : swimCrawl ? (inLavaF ? 3.4 : 5.6) : swim ? (inLavaF ? 2 : 3) : pose === 2 ? 1.8 : pose === 1 ? 1.5 : P.sprint ? 7 : mouseR && eating ? 2 : 4.6;
+  const a = Math.min(1, (P.ground || P.fly || swim ? 16 : 5) * dt);
+  P.vx += (wx * speed + cfx * 1.6 - P.vx) * a; P.vz += (wz * speed + cfz * 1.6 - P.vz) * a;
+  if (P.fly) P.vy = (jump ? 8 : 0) - (shift ? 8 : 0);
+  else if (swimCrawl && fwd > 0) { const ld = lookDir(); P.vy += (ld[1] * speed + (jump ? 2 : 0) - P.vy) * a; } // crawl-swimming goes where you look
+  else if (swim) P.vy = Math.max(inLavaF ? -1.6 : -3, Math.min(inLavaF ? 2.4 : 3.2, P.vy + (jump ? 14 : -10) * dt));
+  else { P.vy = Math.max(-50, P.vy - 28 * dt); if (jump && P.ground && pose !== 2) { P.vy = 9; P.ground = false; } }
+  const steps = Math.max(1, Math.ceil(Math.max(Math.abs(P.vx), Math.abs(P.vy), Math.abs(P.vz)) * dt / 0.4)), h = dt / steps;
+  const edge = pose === 1 && P.ground && !P.fly; // sneaking: stay on the block you are standing on
+  let bumped = false;
+  for (let s = 0; s < steps; s++) {
+    const nx = P.x + P.vx * h; if (collides(nx, P.y, P.z, h0, ign) || (edge && !collides(nx, P.y - 0.6, P.z, 0.6))) { if (!edge && stepUp(nx, P.z, h0, ign, swim)) P.x = nx; else { P.vx = 0; bumped = true; } } else P.x = nx;
+    const nz = P.z + P.vz * h; if (collides(P.x, P.y, nz, h0, ign) || (edge && !collides(P.x, P.y - 0.6, nz, 0.6))) { if (!edge && stepUp(P.x, nz, h0, ign, swim)) P.z = nz; else { P.vz = 0; bumped = true; } } else P.z = nz;
+    const ny = P.y + P.vy * h;
+    if (collides(P.x, ny, P.z, h0, ign)) { if (P.vy < 0) { P.ground = true; P.y = landY(P.x, ny, P.z); } P.vy = 0; }
+    else { P.y = ny; if (P.vy !== 0) P.ground = false; }
+  }
+  if (swim && jump && bumped) P.vy = 8.5; // heave out of the water onto a ledge
+  if (P.y < -10) send({ t: 'respawn' });
+}
+const lookDir = () => [-Math.sin(P.yaw) * Math.cos(P.pitch), Math.sin(P.pitch), -Math.cos(P.yaw) * Math.cos(P.pitch)];
+function raycast(ox, oy, oz, dx, dy, dz, max, srcWater) { // srcWater: an empty bucket can aim at water sources; everything else sees through water // voxel walk (Amanatides & Woo)
+  let x = Math.floor(ox), y = Math.floor(oy), z = Math.floor(oz);
+  const sx = Math.sign(dx), sy = Math.sign(dy), sz = Math.sign(dz);
+  const tdx = dx ? Math.abs(1 / dx) : Infinity, tdy = dy ? Math.abs(1 / dy) : Infinity, tdz = dz ? Math.abs(1 / dz) : Infinity;
+  let tmx = dx > 0 ? (x + 1 - ox) * tdx : dx < 0 ? (ox - x) * tdx : Infinity;
+  let tmy = dy > 0 ? (y + 1 - oy) * tdy : dy < 0 ? (oy - y) * tdy : Infinity;
+  let tmz = dz > 0 ? (z + 1 - oz) * tdz : dz < 0 ? (oz - z) * tdz : Infinity;
+  let t = 0, n = [0, 0, 0];
+  while (t <= max) {
+    const id = getBlock(x, y, z);
+    if (id && ((!isWater(id) && !isLava(id)) || (srcWater && id === B.WATER))) return { x, y, z, id, n, t };
+    if (tmx < tmy && tmx < tmz) { x += sx; t = tmx; tmx += tdx; n = [-sx, 0, 0]; }
+    else if (tmy < tmz) { y += sy; t = tmy; tmy += tdy; n = [0, -sy, 0]; }
+    else { z += sz; t = tmz; tmz += tdz; n = [0, 0, -sz]; }
+  }
+  return null;
+}
+function hitBox(o, d, cx, cy, cz, hw, hh) { // ray against a box, returns distance or Infinity
+  let t0 = 0, t1 = 1e9;
+  for (let i = 0; i < 3; i++) {
+    const c = [cx, cy, cz][i], h = i === 1 ? hh : hw, lo = c - h, hi = c + h;
+    if (Math.abs(d[i]) < 1e-9) { if (o[i] < lo || o[i] > hi) return Infinity; continue; }
+    let a = (lo - o[i]) / d[i], b = (hi - o[i]) / d[i]; if (a > b) [a, b] = [b, a];
+    t0 = Math.max(t0, a); t1 = Math.min(t1, b); if (t0 > t1) return Infinity;
+  }
+  return t0;
+}
+function entityRay(o, d, max) { // nearest creature or player under the crosshair
+  let best = null;
+  for (const m of mobs.values()) { const s = mobDims(MOB_TYPES[m.type], m.size), t = hitBox(o, d, m.x, m.y + s.h / 2 - 0.04, m.z, s.w / 2 + 0.12, s.h / 2 + 0.1); if (t < max && (!best || t < best.t)) best = { k: 'm', id: m.id, t, x: m.x, y: m.y + s.h / 2, z: m.z }; }
+  if (pvpOn()) for (const p of others.values()) { const t = hitBox(o, d, p.x, p.y + 0.86, p.z, 0.42, 1.0); if (t < max && (!best || t < best.t)) best = { k: 'p', id: p.id, t, x: p.x, y: p.y + 0.9, z: p.z }; }
+  return best;
+}
+const pvpOn = () => !!(roomInfo && roomInfo.pvp && mode !== 'creative');
+const overlapsPlayer = (x, y, z) => P.x - W < x + 1 && P.x + W > x && P.z - W < z + 1 && P.z + W > z && P.y < y + 1 && P.y + POSE_H[pose] > y;
+const hl = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1.004, 1.004, 1.004)), new THREE.LineBasicMaterial({ color: 0x000000 }));
+hl.visible = false; scene.add(hl);
+
+/* ---------- mining, attacking, placing, eating, bow ---------- */
+let clickAtk = false, mining = null, mineDelay = 0, swing = 0, chipT = 0, lastAtk = 0, lastPlace = 0, eating = null, charging = null, target = null;
+const startSwing = () => { if (swing <= 0) swing = 0.001; };
+function stopMining() { if (mining) { mining = null; cracks.hide(); } }
+function mine(t, dt) {
+  const key = t.x + ',' + t.y + ',' + t.z;
+  if (!mining || mining.key !== key) {
+    mining = { key, x: t.x, y: t.y, z: t.z, id: t.id, t: 0, need: mode === 'creative' ? 0 : breakTime(t.id, ui.held()) };
+    send({ t: 'dig', x: t.x, y: t.y, z: t.z });
+  }
+  if (mining.need === Infinity) { cracks.hide(); return; }
+  mining.t += dt; startSwing();
+  chipT -= dt; if (chipT <= 0 && mining.need > 0.15) { chipT = 0.11; fx.blockChip(t.id, t.x, t.y, t.z, t.n); }
+  const prog = mining.need <= 0 ? 1 : mining.t / mining.need;
+  if (prog < 1) { cracks.show(t.x, t.y, t.z, Math.floor(prog * 10)); return; }
+  send({ t: 'brk', x: t.x, y: t.y, z: t.z });
+  fx.blockBreak(t.id, t.x, t.y, t.z, 26);
+  setBlock(t.x, t.y, t.z, 0);
+  stopMining(); mineDelay = mode === 'creative' ? 0.2 : 0.18;
+}
+function attack(t) {
+  send({ t: 'atk', k: t.k, id: t.id }); startSwing();
+  fx.burst(t.x, t.y, t.z, [0.85, 0.15, 0.15], 6, 2.5, 0.09, 0.45);
+}
+function useBlock(t, now) {
+  const hs = ui.held(), it = hs && itemInfo(hs.id);
+  if (t.id === B.CHEST || t.id === B.FURNACE || isBed(t.id) || isDoor(t.id)) { const c = saves.foreign(t.x, t.z); if (c) { hint(protectedMsg(c)); return true; } } // the server refuses too; this just explains it
+  if (it && it.block === B.CHUNK_SAVER) { // a Chunk Saver asks for a name first, then the server places it and claims the chunk
+    const cur = getBlock(t.x + t.n[0], t.y + t.n[1], t.z + t.n[2]);
+    if (cur && !isWater(cur)) return true;
+    const c = saves.foreign(t.x + t.n[0], t.z + t.n[2]); if (c) { hint(protectedMsg(c)); return true; }
+    saves.askName({ x: t.x, y: t.y, z: t.z, n: t.n }); return true;
+  }
+  if ([B.TABLE, B.CHEST, B.FURNACE].includes(t.id) || isBed(t.id) || (isDoor(t.id) && pose !== 1)) { send({ t: 'use', x: t.x, y: t.y, z: t.z, nx: t.n[0], ny: t.n[1], nz: t.n[2] }); return true; }
+  if (it && (it.bucket || it.bed || it.door)) { const empty = it.bucket === 'empty', c = saves.foreign(empty ? t.x : t.x + t.n[0], empty ? t.z : t.z + t.n[2]); if (c) { hint(protectedMsg(c)); return true; } }
+  if (it && it.bucket) { // empty bucket scoops the water source it aims at, a full one pours next to the block it aims at; the server decides
+    if (it.bucket === 'empty' ? t.id === B.WATER : !isWater(t.id)) { send({ t: 'use', x: t.x, y: t.y, z: t.z, nx: t.n[0], ny: t.n[1], nz: t.n[2] }); startSwing(); }
+    return true;
+  }
+  if (it && it.door) { send({ t: 'use', x: t.x, y: t.y, z: t.z, nx: t.n[0], ny: t.n[1], nz: t.n[2] }); startSwing(); lastPlace = now; return true; } // the server places both halves
+  if (it && it.bed) { send({ t: 'use', x: t.x, y: t.y, z: t.z, nx: t.n[0], ny: t.n[1], nz: t.n[2] }); startSwing(); lastPlace = now; return true; } // the server lays out both halves
+  if (!(it && it.block)) return false;
+  const x = t.x + t.n[0], y = t.y + t.n[1], z = t.z + t.n[2], cur = getBlock(x, y, z);
+  let place = it.block;
+  if (place === B.TORCH) { place = torchFor(t.n[0], t.n[1], t.n[2]); if (!place || !isSolid(t.id) || isBed(t.id) || isLayer(t.id)) return true; } // top or side of a solid block
+  if (y < 0 || y >= CH || (cur && !isWater(cur) && !isLayer(cur) && !isPlant(cur)) || (!isTorch(place) && overlapsPlayer(x, y, z))) return true;
+  { const c = saves.foreign(x, z); if (c) { hint(protectedMsg(c)); return true; } }
+  setBlock(x, y, z, place); startSwing(); lastPlace = now;
+  send({ t: 'use', x: t.x, y: t.y, z: t.z, nx: t.n[0], ny: t.n[1], nz: t.n[2] }); // predicted here; the server confirms or undoes it
+  return true;
+}
+function rightDown(now) {
+  const hs = ui.held(), it = hs && itemInfo(hs.id);
+  if (target && target.k === undefined && target.id !== undefined && useBlock(target, now)) return;
+  if (it && it.food && (mode !== 'creative') && stats.food < 20) { eating = { t: 0 }; send({ t: 'hold', on: true }); }
+  else if (it && it.bow && (mode === 'creative' || ui.count(I.ARROW) > 0)) charging = { t: 0 };
+}
+function rightUp() {
+  if (eating) { eating = null; send({ t: 'hold', on: false }); }
+  if (charging) {
+    if (charging.t > 0.15) { const d = lookDir(); send({ t: 'shoot', dx: d[0], dy: d[1], dz: d[2], ch: Math.min(1, charging.t) }); startSwing(); }
+    charging = null;
+  }
+}
+
+/* ---------- sky, sun and moon ---------- */
+const NIGHT = new THREE.Color(0x0a1030), DAY = new THREE.Color(0x87ceeb);
+function discTex(draw) { const c = document.createElement('canvas'); c.width = c.height = 32; draw(c.getContext('2d')); const t = new THREE.CanvasTexture(c); t.magFilter = t.minFilter = THREE.NearestFilter; t.generateMipmaps = false; return t; }
+function envTex(img, cell) { const c = document.createElement('canvas'); c.width = c.height = cell; c.getContext('2d').drawImage(img, 0, 0, cell, cell, 0, 0, cell, cell); const t = new THREE.CanvasTexture(c); t.magFilter = t.minFilter = THREE.NearestFilter; t.generateMipmaps = false; t.colorSpace = THREE.SRGBColorSpace; return t; }
+const moonImg = PACK.env.moon, moonCell = moonImg ? (moonImg.width >= moonImg.height * 2 ? moonImg.width / 4 : Math.min(moonImg.width, moonImg.height)) : 0;
+const sun = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), new THREE.MeshBasicMaterial({ map: PACK.env.sun ? envTex(PACK.env.sun, Math.min(PACK.env.sun.width, PACK.env.sun.height)) : discTex((g) => { g.fillStyle = '#fff3a0'; g.fillRect(4, 4, 24, 24); g.fillStyle = '#ffd84a'; g.fillRect(8, 8, 16, 16); g.fillStyle = '#ffffff'; g.fillRect(12, 12, 8, 8); }), transparent: true, depthWrite: false, fog: false }));
+const moon = new THREE.Mesh(new THREE.PlaneGeometry(44, 44), new THREE.MeshBasicMaterial({ map: moonImg ? envTex(moonImg, moonCell) : discTex((g) => { g.fillStyle = '#d9dde6'; g.fillRect(6, 6, 20, 20); g.fillStyle = '#b4bac6'; g.fillRect(10, 9, 5, 5); g.fillRect(17, 16, 6, 6); g.fillRect(9, 19, 4, 4); }), transparent: true, depthWrite: false, fog: false }));
+sun.renderOrder = moon.renderOrder = -1; scene.add(sun, moon);
+const starPos = new Float32Array(240 * 3);
+for (let i = 0; i < 240; i++) { const a = Math.random() * 6.283, e = Math.random() * 1.4 - 0.2, r = 420; starPos.set([Math.cos(a) * Math.cos(e) * r, Math.sin(e) * r, Math.sin(a) * Math.cos(e) * r], i * 3); }
+const starGeo = new THREE.BufferGeometry(); starGeo.setAttribute('position', new THREE.Float32BufferAttribute(starPos, 3));
+const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 2, sizeAttenuation: false, transparent: true, opacity: 0, fog: false, depthWrite: false })); stars.frustumCulled = false; scene.add(stars);
+// A sky dome shades from the horizon colour (which the fog matches) up to a deeper blue, and the horizon warms up around sunrise and sunset.
+const RAIN_TINT = new THREE.Color(0x66707e), SNOW_TINT = new THREE.Color(0xcdd6e0), SAND_TINT = new THREE.Color(0xc29850), tintC = new THREE.Color();
+const SUNSET = new THREE.Color(0xff9a5a), ZEN_DAY = new THREE.Color(0x3f82d8), ZEN_NIGHT = new THREE.Color(0x02050e), zen = new THREE.Color(), hor = new THREE.Color();
+const dome = new THREE.Mesh(new THREE.SphereGeometry(450, 20, 10), new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false }));
+dome.renderOrder = -2; dome.frustumCulled = false; scene.add(dome);
+const domeCol = new Float32Array(dome.geometry.attributes.position.count * 3); dome.geometry.setAttribute('color', new THREE.BufferAttribute(domeCol, 3));
+let skyAng = 1.2, darkF = 0;
+// The y of the top of the ground at a column near you (for rain splashes), or null where there is nothing to splash on.
+function rainHeight(x, z) {
+  const top = Math.min(CH - 1, Math.floor(camera.position.y + 8)), bot = Math.max(1, Math.floor(camera.position.y - 10));
+  for (let y = top; y >= bot; y--) {
+    const id = getBlock(x, y, z);
+    if (id === 0 || id === undefined || id === -1 || isPlant(id) || isTorch(id)) continue;
+    if (isLava(id)) return null;
+    return isWater(id) ? y + 0.85 : y + blockHeight(id);
+  }
+  return null;
+}
+function updateWeather(dt, now) {
+  if (now - biomeAt0 > 500) { biomeAt0 = now; biomeNow = worldGen >= 4 ? biomeAt(P.x, P.z, worldSeed, worldGen) : 0; }
+  const kind = biomeNow === 2 ? 2 : 1; // rain, or snow in the cold biome (rain falls in deserts too)
+  const open = outside && !underground && !eyeInWater() && !dead;
+  wxK += ((wxRain && open ? 1 : 0) - wxK) * Math.min(1, dt * 0.55);
+  sandK += ((wxSand && open && biomeNow === 1 ? 1 : 0) - sandK) * Math.min(1, dt * 0.55); // a sandstorm is only felt in the desert
+  if (wxK > 0.02) wxKind = kind;
+  weather.update(dt, wxK > 0.02 ? wxKind : 0, wxK, sandK, camera.position, rainHeight);
+}
+function sky(inGame) {
+  let t = 1, ang = 1.2;
+  if (inGame) {
+    const ph = ((((Date.now() + tOff - epoch) % dayMs) + dayMs) % dayMs) / dayMs; ang = ph * 6.2832;
+    t = Math.min(1, Math.max(0, (Math.sin(ang) + 0.25) / 0.9));
+  }
+  skyAng = ang;
+  scene.background.copy(NIGHT).lerp(DAY, t);
+  if (inGame) { const glow = Math.max(0, 1 - Math.abs(Math.sin(ang)) / 0.22) * 0.5; if (glow > 0) scene.background.lerp(SUNSET, glow); }
+  scene.fog.color.copy(scene.background);
+  { // the sky term of the world light: bluish dim moonlight at night, white by day, warm at sunrise and sunset
+    const warm = inGame ? Math.max(0, 1 - Math.abs(Math.sin(ang)) / 0.22) * 0.5 : 0, u = LIGHT_U.uSkyMul.value;
+    u.set(0.04 + 0.96 * t, 0.055 + 0.945 * t, 0.12 + 0.88 * t); u.y *= 1 - 0.18 * warm; u.z *= 1 - 0.38 * warm;
+    if (inGame && (wxK > 0.01 || sandK > 0.01)) u.multiplyScalar((1 - 0.22 * wxK) * (1 - 0.3 * sandK)); // storms dim the daylight
+  }
+  scene.fog.near = Math.max(8, cfg.dist * CS * 0.5); scene.fog.far = cfg.dist * CS * 0.95;
+  if (inGame && wxK > 0.01) { // an overcast sky and a shorter view in rain and snow
+    tintC.copy(wxKind === 2 ? SNOW_TINT : RAIN_TINT).multiplyScalar(0.3 + 0.7 * t);
+    scene.background.lerp(tintC, (wxKind === 2 ? 0.62 : 0.55) * wxK); scene.fog.color.copy(scene.background);
+    const f0 = scene.fog.far, n0 = scene.fog.near, fT = f0 * (wxKind === 2 ? 0.5 : 0.72), nT = n0 * 0.4;
+    scene.fog.far = f0 + (fT - f0) * wxK; scene.fog.near = n0 + (nT - n0) * wxK;
+  }
+  if (inGame && sandK > 0.01) { // a sandstorm turns the air orange and the view to a few blocks (it can be on top of rain)
+    tintC.copy(SAND_TINT).multiplyScalar(0.3 + 0.7 * t);
+    scene.background.lerp(tintC, 0.88 * sandK); scene.fog.color.copy(scene.background);
+    const f0 = scene.fog.far, n0 = scene.fog.near;
+    scene.fog.far = f0 + (24 - f0) * sandK; scene.fog.near = n0 + (2 - n0) * sandK;
+  }
+  darkF += ((inGame ? (underground ? 1 : outside ? 0 : 0.45) : 0) - darkF) * 0.04; // smoothly: under rock the haze turns black and short
+  if (darkF > 0.01) { scene.background.multiplyScalar(1 - 0.94 * darkF); scene.fog.color.copy(scene.background); scene.fog.near = scene.fog.near * (1 - darkF) + 4 * darkF; scene.fog.far = scene.fog.far * (1 - darkF) + 34 * darkF; }
+  const cp = camera.position, dx = Math.cos(ang), dy = Math.sin(ang);
+  sun.position.set(cp.x + dx * 300, cp.y + dy * 300, cp.z + 90); sun.lookAt(cp);
+  moon.position.set(cp.x - dx * 300, cp.y - dy * 300, cp.z - 90); moon.lookAt(cp);
+  stars.position.set(cp.x, cp.y, cp.z); stars.material.opacity = Math.max(0, 0.9 - t * 1.6) * (1 - Math.max(wxK, sandK));
+  const under = inGame && eyeInWater();
+  if (under) { scene.background.set(0x1f4fa8); scene.fog.color.set(0x1f4fa8); scene.fog.near = 0.5; scene.fog.far = 22; }
+  const eyeLava = inGame && isLava(getBlock(Math.floor(cp.x), Math.floor(cp.y), Math.floor(cp.z)));
+  if (eyeLava) { scene.background.set(0xcf4a0a); scene.fog.color.set(0xcf4a0a); scene.fog.near = 0.1; scene.fog.far = 3.5; }
+  dome.visible = !under && !eyeLava; dome.position.copy(cp);
+  if (!under && !eyeLava) {
+    hor.copy(scene.background); zen.copy(ZEN_NIGHT).lerp(ZEN_DAY, t); if (inGame && (wxK > 0.01 || sandK > 0.01)) zen.lerp(hor, 0.78 * Math.max(wxK, sandK));
+    const pos = dome.geometry.attributes.position;
+    for (let i = 0; i < pos.count; i++) { const f = Math.pow(Math.max(0, pos.getY(i) / 450), 0.55); domeCol[i * 3] = hor.r + (zen.r - hor.r) * f; domeCol[i * 3 + 1] = hor.g + (zen.g - hor.g) * f; domeCol[i * 3 + 2] = hor.b + (zen.b - hor.b) * f; }
+    dome.geometry.attributes.color.needsUpdate = true;
+  }
+}
+
+/* ---------- other players, creatures, drops, arrows ---------- */
+function labelSprite(text) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 64;
+  const x = c.getContext('2d'); x.font = 'bold 30px sans-serif'; x.textAlign = 'center';
+  x.fillStyle = 'rgba(0,0,0,.55)'; x.fillRect(0, 10, 256, 44); x.fillStyle = '#fff'; x.fillText(text, 128, 44, 240);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), fog: false }));
+  s.scale.set(2, 0.5, 1); s.position.y = 2.2; return s;
+}
+function addOther(p) {
+  removeOther(p.id);
+  const model = makePlayer(p.color); model.g.add(labelSprite(p.name)); setEquipment(model, p.held || 0, p.arm || [0, 0, 0, 0], p.off || 0);
+  model.g.position.set(p.x, p.y, p.z); scene.add(model.g);
+  others.set(p.id, { id: p.id, name: p.name, model, x: p.x, y: p.y, z: p.z, yaw: p.yaw || 0, tx: p.x, ty: p.y, tz: p.z, tyaw: p.yaw || 0, flash: 0, speed: 0, po: p.po || 0, tilt: 0 });
+  renderPlayers();
+}
+function removeOther(id) {
+  const o = others.get(id); if (!o) return;
+  disposeModel(o.model.g); others.delete(id); renderPlayers();
+}
+function renderPlayers() {
+  const names = [session ? session.name : 'You', ...[...others.values()].map((o) => o.name)];
+  $('plist').textContent = `Players (${names.length})\n` + names.join('\n');
+}
+function syncEnts(m) {
+  const seen = new Set();
+  for (const [id, type, x, y, z, yaw, hp, fl, sz, aux, fuse] of m.m) {
+    seen.add(id);
+    let o = mobs.get(id);
+    if (!o) { const model = makeMob(type, aux); model.g.position.set(x, y, z); scene.add(model.g); o = { id, type, model, x, y, z, yaw, speed: 0, vy: 0, flags: 0, size: 1 }; mobs.set(id, o); }
+    Object.assign(o, { tx: x, ty: y, tz: z, tyaw: yaw, flags: fl, size: sz, fuse, hp, aux });
+  }
+  for (const [id, o] of mobs) if (!seen.has(id)) { disposeModel(o.model.g); mobs.delete(id); }
+  const seenI = new Set();
+  for (const [id, item, n, x, y, z] of m.i) {
+    seenI.add(id);
+    let o = drops.get(id);
+    if (!o) { const mesh = itemMesh(item, itemInfo(item) && itemInfo(item).block ? 0.3 : 0.3); mesh.position.set(x, y, z); scene.add(mesh); o = { mesh, x, y, z, n, phase: id * 1.7 }; drops.set(id, o); }
+    o.tx = x; o.ty = y; o.tz = z;
+  }
+  for (const [id, o] of drops) if (!seenI.has(id)) { scene.remove(o.mesh); drops.delete(id); }
+  const seenA = new Set();
+  for (const [id, x, y, z, vx, vy, vz] of m.a) {
+    seenA.add(id);
+    let o = arrows.get(id);
+    if (!o) { const mesh = arrowMesh(); mesh.rotation.order = 'YXZ'; mesh.position.set(x, y, z); scene.add(mesh); o = { mesh, x, y, z }; arrows.set(id, o); }
+    Object.assign(o, { tx: x, ty: y, tz: z, vx, vy, vz });
+  }
+  for (const [id, o] of arrows) if (!seenA.has(id)) { disposeModel(o.mesh); arrows.delete(id); }
+  const seenF = new Set(); // falling sand and gravel
+  for (const [id, b, x, y, z, vy] of m.f || []) {
+    seenF.add(id);
+    let o = fallers.get(id);
+    if (!o) { const mesh = itemMesh(isLayer(b) ? layerFull(layerKind(b)) : b, 1), hy = blockHeight(b); if (isLayer(b)) mesh.scale.y *= hy; mesh.position.set(x, y + hy / 2, z); scene.add(mesh); o = { mesh, x, y, z, ty: y, vy, hy: hy / 2 }; fallers.set(id, o); }
+    o.x = x; o.z = z; o.ty = y; o.vy = vy;
+  }
+  for (const [id, o] of fallers) if (!seenF.has(id)) { scene.remove(o.mesh); fallers.delete(id); }
+}
+function updateEnts(dt, now) {
+  const k = Math.min(1, dt * 12), t = now / 1000;
+  for (const o of fallers.values()) { // between server updates the block keeps falling at the speed the server last reported
+    o.ty += o.vy * dt; o.y += (o.ty - o.y) * Math.min(1, dt * 14);
+    o.mesh.position.set(o.x, o.y + o.hy, o.z);
+  }
+  for (const o of mobs.values()) {
+    const px = o.x, pz = o.z, py = o.y;
+    o.x += (o.tx - o.x) * k; o.y += (o.ty - o.y) * k; o.z += (o.tz - o.z) * k;
+    o.yaw += Math.atan2(Math.sin(o.tyaw - o.yaw), Math.cos(o.tyaw - o.yaw)) * Math.min(1, dt * 10);
+    const sp = Math.hypot(o.x - px, o.z - pz) / Math.max(dt, 1e-3);
+    o.speed += (sp - o.speed) * Math.min(1, dt * 8); o.vy = (o.y - py) / Math.max(dt, 1e-3);
+    o.model.g.position.set(o.x, o.y, o.z); o.model.g.rotation.y = o.yaw + Math.PI;
+    o.model.setFlash(!!(o.flags & 1));
+    o.model.update({ speed: o.speed, flags: o.flags, size: o.size, fuse: o.fuse, t, dt, vy: o.vy, aux: o.aux });
+    entLit(o, mobDims(MOB_TYPES[o.type], o.size), dt);
+  }
+  for (const o of drops.values()) {
+    o.x += (o.tx - o.x) * k; o.y += (o.ty - o.y) * k; o.z += (o.tz - o.z) * k;
+    o.mesh.position.set(o.x, o.y + 0.28 + Math.sin(t * 2.4 + o.phase) * 0.05, o.z); o.mesh.rotation.y = t * 1.4 + o.phase;
+  }
+  for (const o of arrows.values()) {
+    o.x += o.vx * dt; o.y += o.vy * dt; o.z += o.vz * dt; // fly on between server updates
+    o.x += (o.tx - o.x) * Math.min(1, dt * 6); o.y += (o.ty - o.y) * Math.min(1, dt * 6); o.z += (o.tz - o.z) * Math.min(1, dt * 6);
+    o.mesh.position.set(o.x, o.y, o.z); o.mesh.rotation.y = Math.atan2(o.vx, o.vz); o.mesh.rotation.x = -Math.atan2(o.vy, Math.hypot(o.vx, o.vz));
+  }
+  for (const o of others.values()) {
+    const px = o.x, pz = o.z;
+    o.x += (o.tx - o.x) * k; o.y += (o.ty - o.y) * k; o.z += (o.tz - o.z) * k;
+    const dy = o.tyaw - o.yaw; o.yaw += Math.atan2(Math.sin(dy), Math.cos(dy)) * k;
+    o.speed += (Math.hypot(o.x - px, o.z - pz) / Math.max(dt, 1e-3) - o.speed) * Math.min(1, dt * 8);
+    o.tilt += ((o.po === 3 ? -1.45 : o.po === 2 ? 1.45 : o.po === 1 ? 0.32 : 0) - o.tilt) * Math.min(1, dt * 10); // sneaking leans forward, crawling lies face down, sleeping lies on the back
+    const lie = o.tilt / 1.45, gm = o.model.g, ry = o.yaw + Math.PI;
+    gm.rotation.order = 'YXZ'; gm.rotation.y = ry; gm.rotation.x = o.tilt;
+    gm.position.set(o.x - Math.sin(ry) * 0.9 * lie, o.y + 0.25 * Math.abs(lie), o.z - Math.cos(ry) * 0.9 * lie);
+    o.flash = Math.max(0, o.flash - dt); o.model.setFlash(o.flash > 0);
+    o.model.update({ speed: o.speed, swing: 0, pitch: 0, dt, t });
+    entLit(o, { w: 0.6, h: 1.8 }, dt);
+  }
+  for (let i = ghosts.length - 1; i >= 0; i--) { // death animation: tip over, shrink away
+    const o = ghosts[i]; o.t += dt;
+    o.model.g.rotation.z = Math.min(1.5, o.t * 5); o.model.g.position.y = o.y; o.model.g.scale.setScalar(Math.max(0.01, 1 - Math.max(0, o.t - 0.45) * 2.2));
+    if (o.t > 0.9) { disposeModel(o.model.g); ghosts.splice(i, 1); }
+  }
+}
+
+/* ---------- networking ---------- */
+function setConn(t, ok) { const e = $('conn'); e.textContent = t; e.className = ok ? '' : 'bad'; }
+function openSocket() {
+  const sock = new WebSocket(net.ws + '/ws'); ws = sock; setConn('Connecting…', false);
+  sock.onopen = () => send({ t: 'join', name: session.name, room: session.room, create: session.create, roomName: session.roomName, seed: session.seed, mode: session.mode, pvp: session.pvp, cheats: session.cheats, token: store.get('token', null) });
+  sock.onmessage = (e) => { let m; try { m = JSON.parse(e.data); } catch { return; } onMsg(m); };
+  sock.onclose = () => {
+    if (ws !== sock) return;
+    ws = null; joined = false;
+    if (leaving) return;
+    if (++retry > 14) return leaveToMenu('Lost the connection to the game server.');
+    setConn('Reconnecting…', false);
+    setTimeout(() => { if (!leaving && !ws) openSocket(); }, Math.min(8000, 400 * 2 ** retry));
+  };
+}
+function onMsg(m) {
+  switch (m.t) {
+    case 'welcome': {
+      resetWorld(m.room.seed, normGen(m.room.gen)); store.set('token', m.token); retry = 0; myId = m.pid; dead = false; ui.hideDead();
+      roomInfo = m.room; session.room = m.room.id; session.create = false; mode = m.room.mode; ui.setMode(mode);
+      tOff = m.now - Date.now(); epoch = m.epoch; dayMs = m.dayMs; wxRain = !!(m.wx && m.wx.rain); wxSand = !!(m.wx && m.wx.sand); wxK = 0; sandK = 0;
+      for (let i = 0; i + 3 < m.edits.length; i += 4) setBlock(m.edits[i], m.edits[i + 1], m.edits[i + 2], m.edits[i + 3]);
+      Object.assign(P, { x: m.me.x, y: m.me.y, z: m.me.z, yaw: m.me.yaw || 0, pitch: m.me.pitch || 0, vx: 0, vy: 0, vz: 0, fly: false });
+      for (const p of m.players) addOther(p);
+      joined = true; setConn('Online', true); $('save').textContent = ''; renderPlayers(); saves.onWelcome(m); enterGame();
+      break;
+    }
+    case 'inv': ui.setInv(m); break;
+    case 'st': Object.assign(stats, { hp: m.hp, food: m.food, air: m.air, def: m.def }); ui.setStats(m); break;
+    case 'open': if (!dead) { unlock(); ui.open(m.kind); } break;
+    case 'wclose': ui.close(false); if (state === 'play' && !locked && !dead) { $('pause').hidden = false; $('resume').textContent = 'Resume'; } break;
+    case 'wp': ui.setProgress(m.pr); break;
+    case 'pj': addOther(m.p); break;
+    case 'pl': removeOther(m.id); break;
+    case 'eq': { const o = others.get(m.id); if (o) setEquipment(o.model, m.held, m.arm, m.off || 0); break; }
+    case 'ps': for (const [id, x, y, z, yaw, , po] of m.s) { const o = others.get(id); if (o) { o.tx = x; o.ty = y; o.tz = z; o.tyaw = yaw; o.po = po | 0; } } break;
+    case 'ents': syncEnts(m); break;
+    case 'blk': {
+      const old = getBlock(m.x, m.y, m.z);
+      setBlock(m.x, m.y, m.z, m.id);
+      if (m.id === 0 && old > 0 && !isWater(old) && old !== B.BEDROCK) fx.blockBreak(old, m.x, m.y, m.z, 14); // someone else's mining
+      break;
+    }
+    case 'wx': wxRain = !!m.rain; wxSand = !!m.sand; break; // rain or a sandstorm switched on or off
+    case 'blks': for (let i = 0; i + 3 < m.b.length; i += 4) setBlock(m.b[i], m.b[i + 1], m.b[i + 2], m.b[i + 3]); break;
+    case 'fx': onFx(m); break;
+    case 'kb': P.vx += m.x; P.vy = Math.max(P.vy, m.y); P.vz += m.z; P.ground = false; break;
+    case 'sleep':
+      if (m.on) { sleeping = { x: m.x, y: m.y, z: m.z, dir: m.dir }; const [dx, dz] = DIR4[m.dir]; P.x = m.x + 0.5; P.y = m.y + BED_H; P.z = m.z + 0.5; P.vx = P.vy = P.vz = 0; P.yaw = Math.atan2(dx, dz); P.pitch = 1.35; keys.clear(); stopMining(); rightUp(); }
+      else { sleeping = null; P.x = m.x; P.y = m.y; P.z = m.z; P.vx = P.vy = P.vz = 0; P.pitch = 0; P.ground = false; }
+      break;
+    case 'time': epoch = m.epoch; break;
+    case 'dead':
+      sleeping = null; dead = true; stopMining(); rightUp(); keys.clear(); ui.close(false); ui.showDead(m.m);
+      unlock();
+      $('pause').hidden = true; break;
+    case 'chat': addChat(m); break;
+    case 'fix':
+      P.x = m.x; P.y = m.y; P.z = m.z; P.vx = P.vy = P.vz = 0;
+      if (dead) { dead = false; ui.hideDead(); if (state === 'play' && !locked) { $('pause').hidden = false; $('resume').textContent = 'Resume'; } }
+      break;
+    case 'save': $('save').textContent = m.ok ? 'World saved' : 'Could not save, retrying…'; $('save').className = m.ok ? '' : 'bad'; break;
+    case 'err': if (m.fatal) leaveToMenu(m.m); else addChat({ sys: 1, m: m.m }); break;
+    case 'rset': { // the host changed the world's settings
+      roomInfo = m.room; mode = m.room.mode; ui.setMode(mode); saves.onRoom(m.room); $('hostBtn').hidden = !(roomInfo.owner && !roomInfo.locked);
+      $('pSub').textContent = subText(); break;
+    }
+    default: saves.onMsg(m);
+  }
+}
+function onFx(m) {
+  audio.fx(m);
+  if (m.k === 'hurt') {
+    if (m.id === myId) { ui.flash(); } else { const o = others.get(m.id); if (o) o.flash = 0.25; }
+  } else if (m.k === 'die') {
+    const model = makeMob(m.ty, m.aux); model.g.position.set(m.x, m.y, m.z); model.g.rotation.y = m.yaw + Math.PI;
+    if (m.ty === 10) model.update({ speed: 0, flags: 32, size: m.sz, t: 0, dt: 0, vy: 0 });
+    scene.add(model.g); model.setFlash(true); ghosts.push({ model, t: 0, y: m.y });
+    fx.burst(m.x, m.y + 0.5, m.z, [0.92, 0.92, 0.92], 12, 2.2, 0.12, 0.8);
+  } else if (m.k === 'crit') { fx.burst(m.x, m.y, m.z, [1, 0.92, 0.4], 16, 3.4, 0.09, 0.55); fx.burst(m.x, m.y, m.z, [1, 1, 1], 8, 2.2, 0.07, 0.4); }
+  else if (m.k === 'boom') fx.explosion(m.x, m.y, m.z);
+  else if (m.k === 'block') { const o = m.id === myId ? P : others.get(m.id); if (o) fx.burst(o.x, o.y + 1.2, o.z, [0.82, 0.82, 0.88], 8, 2.5, 0.08, 0.5); } // a shield took a hit
+}
+let lastSend = 0, lastKey = '';
+function netSend(now) {
+  if (!joined || dead || sleeping || now - lastSend < 50) return;
+  const r = (v) => Math.round(v * 100) / 100, yaw = r(P.yaw % 6.2832), pitch = r(P.pitch), key = [r(P.x), r(P.y), r(P.z), yaw, pitch, P.sprint, pose].join();
+  if (key === lastKey && now - lastSend < 1000) return;
+  lastKey = key; lastSend = now; send({ t: 'pos', x: r(P.x), y: r(P.y), z: r(P.z), yaw, pitch, sp: P.sprint, po: pose });
+}
+
+/* ---------- menu, HUD, input ---------- */
+const menuBtns = ['play', 'join', 'create', 'worldsBtn', 'gsExport', 'gsImport'].map($);
+const menuMsg = (t) => { $('menumsg').textContent = t; };
+const busy = (b) => menuBtns.forEach((x) => { x.disabled = b || !serverReady; });
+// On a phone or tablet there is no pointer lock: "locked" simply means the touch controls are active (and no menu is open).
+const isTouch = matchMedia('(pointer: coarse)').matches || (navigator.maxTouchPoints > 1 && !matchMedia('(pointer: fine)').matches);
+if (isTouch) document.body.classList.add('touch');
+const lock = () => {
+  if (isTouch) { // first Play: go fullscreen and landscape if the browser allows it
+    try { const d = document.documentElement; if (!document.fullscreenElement && d.requestFullscreen) d.requestFullscreen().then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape').catch(() => {})).catch(() => {}); } catch { /* optional */ }
+    return applyLock(true);
+  }
+  const r = canvas.requestPointerLock(); if (r && r.catch) r.catch(() => {});
+};
+const unlock = () => { if (isTouch) { if (locked) setTimeout(() => { if (locked) applyLock(false); }, 0); } else if (document.pointerLockElement) document.exitPointerLock(); }; // like the real pointer-lock event, it lands after whatever opened the menu has finished
+
+function start(opts) {
+  autosave.arm(); // lets the game keep writing to the save file you picked before (the browser may ask once after a restart)
+  const name = $('name').value.trim().slice(0, 16) || 'Builder' + ((Math.random() * 900 + 100) | 0);
+  store.set('name', name); session = { name, ...opts }; leaving = false; retry = 0; joined = false;
+  busy(true); menuMsg('Joining…'); openSocket();
+}
+function enterGame() {
+  busy(false);
+  if (state === 'play') return;
+  state = 'play'; $('menu').hidden = true; $('hud').hidden = false; $('pause').hidden = false; reminder.setPlaying(true); autosave.start();
+  $('pTitle').textContent = roomInfo.name; $('pCode').textContent = roomInfo.id;
+  $('pSub').textContent = subText(); $('hostBtn').hidden = !(roomInfo.owner && !roomInfo.locked);
+  $('resume').textContent = 'Play';
+}
+function subText() {
+  const tail = `${mode === 'creative' ? 'Creative' : 'Survival'}${roomInfo.pvp && mode !== 'creative' ? ', PvP on' : ''}${roomInfo.live ? ', live' : ''}. `;
+  return tail + (roomInfo.owner && !roomInfo.locked ? 'You are the host of this world. Type /help in chat.' : (isTouch ? 'Tap Play. Left thumb moves, drag the right side to look, tap to place or hit, hold to mine.' : 'Press Play, then click the screen to look around.'));
+}
+function leaveToMenu(msg) {
+  if (state === 'play' && roomInfo && roomInfo.owner && !roomInfo.locked) { try { renderer.render(scene, camera); takeShot(); } catch { /* the picture is a nicety */ } } // the picture for "Your worlds"
+  reminder.setPlaying(false); autosave.stop(); autosave.later(1500); setTimeout(refreshWorlds, 1200); // one more quiet save once the server has stored where you left off
+  leaving = true; joined = false; state = 'menu'; dead = false; audio.stop();
+  if (ws) { const s = ws; ws = null; s.close(); }
+  unlock();
+  ui.close(false); ui.hideDead(); stopMining(); eating = charging = null; sleeping = null; saves.reset();
+  $('hud').hidden = true; $('pause').hidden = true; $('menu').hidden = false; keys.clear();
+  resetWorld(MENU_SEED, 2); busy(false); menuMsg(msg || '');
+}
+function addChat(m) {
+  const d = document.createElement('div');
+  if (m.sys) d.className = 'sys';
+  d.textContent = m.sys ? m.m : `${m.from}: ${m.m}`; // textContent only: chat is never parsed as HTML
+  const log = $('log'); log.append(d);
+  while (log.children.length > 30) log.firstChild.remove();
+  setTimeout(() => d.remove(), 25000);
+}
+function selectSlot(i) { i = ((i % 9) + 9) % 9; if (i === ui.sel) return; lastAtk = performance.now(); ui.selectSlot(i); send({ t: 'hot', i }); stopMining(); rightUp(); }
+function openChat() { chatOpen = true; unlock(); const i = $('chatIn'); i.hidden = false; i.value = ''; i.focus(); }
+function closeChat(sendIt) {
+  const i = $('chatIn'), v = i.value.trim();
+  if (sendIt && v) send({ t: 'chat', m: v });
+  i.value = ''; i.hidden = true; i.blur(); chatOpen = false; lock();
+}
+function toggleInventory() {
+  if (ui.isOpen) { ui.close(true); lock(); return; }
+  unlock();
+  keys.clear(); mouseL = mouseR = false; stopMining(); rightUp(); ui.open('inv');
+}
+
+$('play').onclick = () => start({ room: 'PUBLIC' });
+$('join').onclick = () => {
+  const code = $('code').value.trim().toUpperCase();
+  if (!/^[A-Z0-9]{4,10}$/.test(code)) return menuMsg('Enter the world code: letters and numbers only.');
+  start({ room: code });
+};
+$('create').onclick = () => start({ create: true, roomName: $('wname').value.trim(), seed: $('seed').value.trim(), mode: $('mode').value, pvp: $('pvp').checked, cheats: $('cheats').checked });
+$('resume').onclick = lock;
+$('saveBtn').onclick = () => saves.openPanel();
+$('hostBtn').onclick = () => saves.openHost();
+$('worldsBtn').onclick = () => saves.openWorlds();
+const gameSaves = createGameSaves({
+  store, url: (p) => net.http + p, onSaved: () => { reminder.saved(); setTimeout(refreshWorlds, 300); },
+  apply: (c) => { // settings from an imported file: name and options
+    if (c.name) { store.set('name', c.name); $('name').value = c.name; }
+    if (c.lastSave) reminder.restoreLast(c.lastSave);
+    if (c.cfg) { Object.assign(cfg, c.cfg); store.set('cfg', cfg); for (const [id, key] of [['sDist', 'dist'], ['sFov', 'fov'], ['sSens', 'sens']]) $(id).value = cfg[key]; camera.fov = cfg.fov; camera.updateProjectionMatrix(); }
+  },
+  onClose: () => refreshWorlds(),
+});
+// The game saves itself every 10 seconds, quietly (see autosave.js); U just does the next save early.
+const autosave = createAutosave({
+  snapshot: () => gameSaves.snapshot(),
+  ready: () => serverReady && !gameSaves.busy && !!store.get('token', null),
+  onChange: () => reminder.render(),
+});
+const reminder = createReminder({
+  store, autosave, hasGame: () => !!store.get('token', null),
+  save: async () => {
+    if (autosave.needsPick) unlock(); // the first time, a small window asks where to keep the save file
+    const r = await autosave.now();
+    if (r === true) reminder.notify('Game saved'); else if (r === false) reminder.notify('Could not save right now', 'warn', 3500);
+  },
+});
+reminder.guardUnload(); reminder.render();
+$('gsExport').onclick = () => gameSaves.exportGame();
+$('gsImport').onclick = () => gameSaves.pick();
+$('saveGameBtn').onclick = () => reminder.save();
+$('leave').onclick = () => reminder.confirmLeave(() => leaveToMenu(''));
+$('copy').onclick = () => { try { navigator.clipboard.writeText(roomInfo.id); $('copy').textContent = 'Copied'; setTimeout(() => ($('copy').textContent = 'Copy'), 1500); } catch { /* clipboard blocked */ } };
+for (const [id, key] of [['sDist', 'dist'], ['sFov', 'fov'], ['sSens', 'sens']]) {
+  $(id).value = cfg[key];
+  $(id).oninput = () => { cfg[key] = +$(id).value; store.set('cfg', cfg); if (key === 'fov') { camera.fov = cfg.fov; camera.updateProjectionMatrix(); } };
+}
+canvas.addEventListener('click', () => { if (state === 'play' && !locked && !chatOpen && !ui.isOpen && !dead && !saves.isOpen) lock(); });
+function applyLock(v) {
+  locked = v;
+  if (!locked) { keys.clear(); mouseL = mouseR = false; stopMining(); rightUp(); if (state === 'play') shotWant = true; }
+  if (state === 'play') { const other = ui.isOpen || dead || saves.isOpen; $('pause').hidden = locked || chatOpen || other; if (!locked && !chatOpen && !other) $('resume').textContent = 'Resume'; }
+}
+document.addEventListener('pointerlockchange', () => applyLock(document.pointerLockElement === canvas));
+addEventListener('keydown', (e) => {
+  if (e.target instanceof HTMLInputElement) {
+    if (e.target.id === 'chatIn') { if (e.key === 'Enter') closeChat(true); else if (e.key === 'Escape') closeChat(false); }
+    else if (e.key === 'Escape' && saves.isOpen) { e.preventDefault(); saves.key(e); }
+    return;
+  }
+  if (saves.isOpen) { if (e.code === 'Escape') { e.preventDefault(); saves.key(e); } return; }
+  if (state !== 'play' || dead) return;
+  if (ui.isOpen) { if (e.code === 'KeyE' || e.code === 'Escape') { e.preventDefault(); ui.close(true); lock(); } return; }
+  if (!locked) return;
+  if (sleeping) { if (WAKE_KEYS.includes(e.code)) send({ t: 'wake' }); return; }
+  if (e.code === 'Space') e.preventDefault();
+  keys.add(e.code);
+  if (e.repeat) return;
+  if (e.code === 'KeyW') { const t = performance.now(); if (t - lastTapW < 300 && !e.shiftKey) sprintOn = true; lastTapW = t; } // double-tap W to sprint
+  if (e.code === 'Enter') { e.preventDefault(); openChat(); }
+  else if (e.code === 'KeyE') toggleInventory();
+  else if (e.code === 'KeyQ') send({ t: 'drop', all: e.ctrlKey ? 1 : 0 });
+  else if (e.code === 'KeyF' && mode === 'creative') { P.fly = !P.fly; P.vy = 0; }
+  else if (e.code === 'KeyR') send({ t: 'respawn' });
+  else if (e.code === 'KeyP' && saves.placing) saves.pressPlace();
+  else if (e.code === 'KeyU') { e.preventDefault(); reminder.save(); }
+  else if (/^Digit[1-9]$/.test(e.code)) selectSlot(+e.code.slice(5) - 1);
+});
+addEventListener('keyup', (e) => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+addEventListener('mousemove', (e) => {
+  if (!locked || sleeping) return;
+  P.yaw -= e.movementX * 0.0022 * cfg.sens;
+  P.pitch = Math.max(-1.55, Math.min(1.55, P.pitch - e.movementY * 0.0022 * cfg.sens));
+});
+canvas.addEventListener('mousedown', (e) => {
+  if (!locked) return;
+  if (e.button === 0) { mouseL = true; clickAtk = true; }
+  if (e.button === 2) { mouseR = true; rightDown(performance.now()); }
+});
+addEventListener('mouseup', (e) => { if (e.button === 0) { mouseL = false; clickAtk = false; stopMining(); } if (e.button === 2) { mouseR = false; rightUp(); } });
+addEventListener('contextmenu', (e) => e.preventDefault());
+addEventListener('wheel', (e) => { if (locked) selectSlot(ui.sel + (e.deltaY > 0 ? 1 : -1)); }, { passive: true });
+// Phone and tablet controls (touch.js) press the same things the keyboard and mouse do.
+const touch = isTouch ? createTouch({
+  keys, mode: () => mode, sleeping: () => !!sleeping, wake: () => send({ t: 'wake' }),
+  sprint: (on) => { if (on && locked) sprintOn = true; },
+  look: (dx, dy) => { if (!locked || sleeping) return; P.yaw -= dx * cfg.sens; P.pitch = Math.max(-1.55, Math.min(1.55, P.pitch - dy * cfg.sens)); },
+  mine: (on) => { if (!locked) return; if (on) { mouseL = true; clickAtk = true; } else { mouseL = false; clickAtk = false; stopMining(); } },
+  aimsAtFoe: () => { if (!locked || !target || target.k === undefined) return false; const hs = ui.held(), it = hs && itemInfo(hs.id); return !(it && (it.bow || it.food)); }, // a mob or player is under the crosshair (and the hand is not holding a bow or food)
+  hit: () => { if (!locked || !target || target.k === undefined) return; stopMining(); const nw = performance.now(); if (nw - lastAtk < Math.max(120, attackCooldown(ui.held()) * 1000) * 0.62) return; lastAtk = nw; attack(target); }, // one tap = one hit, no holding
+  use: (on) => { if (on) { if (!locked) return; mouseR = true; rightDown(performance.now()); } else if (mouseR) { mouseR = false; rightUp(); } },
+  slot: (i) => selectSlot(i), inventory: () => { if (state === 'play' && !dead) toggleInventory(); }, chat: () => { if (state === 'play' && locked) openChat(); },
+  menu: () => unlock(), save: () => reminder.save(), fly: () => { if (mode === 'creative') { P.fly = !P.fly; P.vy = 0; } },
+}) : null;
+
+/* ---------- server discovery: Netlify function, ?server=, or same origin ---------- */
+async function resolveServer() {
+  const q = new URLSearchParams(location.search).get('server');
+  if (q) store.set('server', q);
+  let s = q || '';
+  if (!s) { try { const r = await fetch('/api/config', { cache: 'no-store' }); if (r.ok) s = (await r.json()).server || ''; } catch { /* no config function here */ } }
+  if (!s) s = store.get('server', '') || location.origin;
+  s = s.trim().replace(/\/+$/, '');
+  if (!/^(https?|wss?):\/\//.test(s)) s = 'https://' + s; // address pasted without https://? assume it
+  return { http: s.replace(/^ws/, 'http'), ws: s.replace(/^http/, 'ws') };
+}
+// If the server has lost something that the last autosave still has (free hosts reset), put it back. Nothing that is still on the server is touched.
+async function autoRestoreOnLoad() {
+  try {
+    const f = await autosave.loadSaved(); if (!f) return;
+    const res = await gameSaves.autoRestore(f.buf);
+    if (res && res.restored.length) { menuMsg('The server had lost part of your game, so it was put back from your last autosave.'); refreshWorlds(); }
+  } catch { /* nothing to restore or the server is busy: Import Game Save still works by hand */ }
+}
+async function pollHealth() {
+  for (let i = 0; i < 70; i++) {
+    try {
+      const r = await fetch(net.http + '/health', { cache: 'no-store' });
+      if (r.ok) { const j = await r.json(); if (j.game === 'voxel-realms') { serverReady = true; busy(false); refreshWorlds(); autoRestoreOnLoad(); return menuMsg(''); } }
+      else if (r.status === 404) break;
+    } catch { /* server asleep or unreachable: keep trying */ }
+    menuMsg(i < 2 ? 'Contacting the game server…' : 'Waking the game server (free hosts can take about a minute)…');
+    await new Promise((res) => setTimeout(res, 2500));
+  }
+  menuMsg('No game server found. On Netlify, set GAME_SERVER_URL (see the README), or open this page with ?server=https://your-server');
+}
+
+/* ---------- main loop ---------- */
+let last = performance.now(), infoAt = 0, bobT = 0;
+function play(dt, now) {
+  const ready = chunksReady(), busyUI = ui.isOpen || dead;
+  streamChunks(P.x, P.z, ready ? 6 : 40);
+  if (ready && joined && !dead && !sleeping) physics(dt);
+  eyeY += ((sleeping ? 0.25 : POSE_EYE[pose]) - eyeY) * Math.min(1, dt * 14);
+  sleepT = sleeping ? sleepT + dt : 0; // the screen fades to black while you sleep
+  $('sleepfade').style.opacity = sleeping ? Math.min(0.92, sleepT / 2.2) : 0; $('sleephint').style.opacity = sleeping ? Math.max(0, Math.min(1, sleepT - 1.2)) : 0;
+  camera.position.set(P.x, P.y + eyeY, P.z); camera.rotation.set(P.pitch, P.yaw, 0);
+  const hh0 = ui.held(), hi0 = hh0 && itemInfo(hh0.id);
+  $('smother').classList.toggle('on', ready && isSolid(getBlock(Math.floor(P.x), Math.floor(P.y + eyeY), Math.floor(P.z)))); // head inside a block: the view goes dark
+  const d = lookDir(), o = [P.x, P.y + eyeY, P.z], bh = raycast(o[0], o[1], o[2], d[0], d[1], d[2], mode === 'creative' ? 7 : 5, !!(hi0 && hi0.bucket === 'empty')), eh = busyUI ? null : entityRay(o, d, 4.5);
+  target = eh && (!bh || eh.t < bh.t) ? eh : bh;
+  const blockT = target && target.k === undefined ? target : null;
+  if (blockT && !busyUI) { hl.visible = true; hl.position.set(blockT.x + 0.5, blockT.y + 0.5, blockT.z + 0.5); } else hl.visible = false;
+  mineDelay = Math.max(0, mineDelay - dt);
+  if (locked && !busyUI && mouseL) {
+    if (target && target.k !== undefined) {
+      stopMining(); const cdm = Math.max(120, attackCooldown(ui.held()) * 1000);
+      if (clickAtk) { clickAtk = false; if (now - lastAtk >= cdm * 0.62) { lastAtk = now; attack(target); } } // too early: nothing happens, so spamming gains nothing
+      else if (now - lastAtk > cdm) { lastAtk = now; attack(target); } // holding the button swings again as soon as the swing is fully recharged
+    }
+    else if (blockT && mineDelay <= 0) { const fc = saves.foreign(blockT.x, blockT.z); if (fc) { hint(protectedMsg(fc)); stopMining(); } else mine(blockT, dt); }
+    else if (!blockT) stopMining();
+  }
+  if (locked && !busyUI && mouseR && blockT && !eating && !charging && now - lastPlace > 250) { const hs = ui.held(), it = hs && itemInfo(hs.id); if (it && it.block) useBlock(blockT, now); }
+  if (eating) { eating.t += dt; if (eating.t >= 1.6) { send({ t: 'eat' }); eating = null; send({ t: 'hold', on: false }); } }
+  if (charging) charging.t = Math.min(1.2, charging.t + dt);
+  if (swing > 0) { swing += dt * (mining ? 3.2 : 4.5); if (swing >= 1) swing = mining ? 0.001 : 0; }
+  { // the attack charge bar under the crosshair fills while the swing recharges
+    const hsA = ui.held(), cd = attackCooldown(hsA) * 1000, fr = Math.min(1, (now - lastAtk) / cd);
+    atkBar.classList.toggle('on', fr < 1 && locked && !busyUI); atkFill.style.width = `${Math.round(fr * 100)}%`;
+  }
+  const hs = ui.held(); held.set(hs ? hs.id : 0);
+  const off = ui.offhand(), hit = hs && itemInfo(hs.id), usable = hit && (hit.block || hit.food || hit.bow || hit.bucket || hit.bed || hit.door);
+  const guarding = !!(locked && !busyUI && !sleeping && mouseR && off && itemInfo(off.id).shield && !usable && !eating && !charging); // hold right click with a shield and nothing else to use
+  if (guarding !== guardSent) { guardSent = guarding; send({ t: 'guard', on: guarding }); }
+  bobT += dt; held.g.visible = !dead && !ui.isOpen;
+  held.update(dt, { swing, eating: !!eating, charge: charging ? Math.min(1, charging.t) : 0, drawing: !!charging, chargeT: charging ? charging.t : 0, guard: guarding, off: off ? off.id : 0, moving: !!(keys.has('KeyW') || keys.has('KeyS') || keys.has('KeyA') || keys.has('KeyD')) && P.ground });
+  updateEnts(dt, now); fx.update(dt);
+  borders.update(P.x, P.z, now / 1000); saves.update(P.x, P.z); reminder.tick(dt);
+  if (touch) touch.setState(dead || saves.isOpen || chatOpen ? 'hidden' : ui.isOpen ? 'ui' : locked ? 'play' : 'hidden');
+  updateWeather(dt, now); sky(true); netSend(now);
+  if (now - outsideAt > 300) { // "outside" = open sky overhead: most of five upward rays (centre and four sides) reach the sky, so a few leaves or an eave do not count as a roof
+    outsideAt = now; let clear = 0;
+    for (const [ox, oz] of [[0, 0], [1.2, 0], [-1.2, 0], [0, 1.2], [0, -1.2]]) if (!raycast(P.x + ox, P.y + eyeY, P.z + oz, 0, 1, 0, CH, false)) clear++;
+    outside = clear >= 3;
+    underground = !outside && P.y + eyeY < column(Math.floor(P.x), Math.floor(P.z), worldSeed, worldGen).h - 5; // roofed over and well below the natural ground: caves and tunnels, not a house
+  }
+  audio.update(dt, { on: !dead, ang: skyAng, look: d, x: P.x, y: P.y + eyeY, z: P.z, yaw: P.yaw, mobs, under: eyeInWater(), outside, underground, deep: underground && P.y + eyeY < deepLine(worldGen), biome: biomeNow, wxKind: wxK > 0.02 ? wxKind : 0, wxK, sandK });
+  if (now - infoAt > 250) { infoAt = now; $('pos').textContent = `${P.x.toFixed(1)}, ${P.y.toFixed(1)}, ${P.z.toFixed(1)}${P.fly ? ' (flying)' : ''}`; }
+}
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  audio.menu(dt, state === 'menu'); // sunset song on the home screen
+  if (state === 'play') play(dt, now);
+  else {
+    const a = still ? 0.8 : now / 22000; // title screen: slow flyover of a generated world
+    camera.position.set(Math.cos(a) * 44, 38, Math.sin(a) * 44); camera.lookAt(0, 22, 0);
+    wxK = 0; sandK = 0; weather.update(dt, 0, 0, 0, camera.position); streamChunks(camera.position.x, camera.position.z, 10); sky(false); hl.visible = false; held.g.visible = false; fx.update(dt);
+  }
+  waterTex.offset.y = 1 - ((Math.floor(now / 90) % WATER_FRAMES) + 1) / WATER_FRAMES;
+  lavaTex.offset.y = 1 - ((Math.floor(now / 130) % LAVA_FRAMES) + 1) / LAVA_FRAMES;
+  flowTex.offset.y = 1 - ((Math.floor(now / 70) % FLOW_FRAMES) + 1) / FLOW_FRAMES;
+  renderer.render(scene, camera);
+  if (shotWant) { shotWant = false; takeShot(); }
+}
+
+
+/* ---------- "Your worlds": the home screen list, with a picture of where you last looked ---------- */
+let shotWant = false, shotAt = 0;
+function takeShot() { // a small JPEG of the current view, sent to the server for the world's host only (the server ignores everyone else)
+  if (!roomInfo || !roomInfo.owner || roomInfo.locked || !ws || ws.readyState !== 1) return;
+  try { // a picture is a nicety: if anything about it fails, the game carries on
+    const c = document.createElement('canvas'); c.width = 320; c.height = 180;
+    const src = renderer.domElement, sw = src.width, sh = src.height; let cw = sw, ch = sw * 9 / 16; if (ch > sh) { ch = sh; cw = sh * 16 / 9; }
+    c.getContext('2d').drawImage(src, (sw - cw) / 2, (sh - ch) / 2, cw, ch, 0, 0, 320, 180);
+    const img = c.toDataURL('image/jpeg', 0.6);
+    if (img.length < 65000) send({ t: 'thumb', img });
+  } catch { /* ignore */ }
+}
+setInterval(() => { if (state === 'play' && locked && document.visibilityState === 'visible') shotWant = true; }, 45000);
+const ago = (t) => { if (!t) return 'never played'; const m = Math.round((Date.now() - t) / 60000); return m < 2 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`; };
+async function refreshWorlds() {
+  const box = $('myWorlds'), token = store.get('token', null);
+  if (!token) { box.innerHTML = ''; const d = document.createElement('div'); d.className = 'wempty'; d.textContent = 'No worlds yet. Create a private world and it will show up here, with a picture of where you left off.'; box.append(d); return; }
+  try {
+    const r = await fetch(net.http + '/api/myworlds', { method: 'POST', body: JSON.stringify({ token }), cache: 'no-store' });
+    const j = await r.json(); box.textContent = '';
+    if (!j.worlds || !j.worlds.length) { const d = document.createElement('div'); d.className = 'wempty'; d.textContent = 'No worlds yet. Create a private world and it will show up here, with a picture of where you left off.'; box.append(d); return; }
+    const grid = document.createElement('div'); grid.className = 'wgrid';
+    for (const w of j.worlds) {
+      const card = document.createElement('div'); card.className = 'wcard'; card.tabIndex = 0; card.setAttribute('role', 'button');
+      if (w.thumb) { const im = document.createElement('img'); im.className = 'pic'; im.alt = ''; im.src = w.thumb; card.append(im); } else { const n = document.createElement('div'); n.className = 'noimg'; n.textContent = 'NO PICTURE YET'; card.append(n); }
+      if (w.live) { const l = document.createElement('span'); l.className = 'live'; l.textContent = 'LIVE'; card.append(l); }
+      const inf = document.createElement('div'); inf.className = 'inf'; const b = document.createElement('b'); b.textContent = w.name; const sm = document.createElement('small'); sm.textContent = `${w.mode === 'creative' ? 'Creative' : 'Survival'} · ${w.players ? `${w.players} online` : ago(w.seen)} · code ${w.id}`;
+      inf.append(b, sm); card.append(inf);
+      const play = document.createElement('button'); play.type = 'button'; play.className = 'go pl'; play.textContent = 'Play'; card.append(play);
+      const go = () => { if (serverReady && !$('play').disabled) start({ room: w.id }); };
+      card.onclick = go; card.onkeydown = (e) => { if (e.key === 'Enter') go(); };
+      grid.append(card);
+    }
+    box.append(grid);
+  } catch { box.textContent = ''; const d = document.createElement('div'); d.className = 'wempty'; d.textContent = 'Could not load your worlds. Is the server running?'; box.append(d); }
+}
+
+$('name').value = store.get('name', '');
+resetWorld(MENU_SEED, 2);
+menuMsg('Finding the game server…');
+resolveServer().then((n) => { net = n; return pollHealth(); });
+requestAnimationFrame(frame);
